@@ -2,22 +2,18 @@ using Dalamud.Bindings.ImGui;
 using Dalamud.Game.Command;
 using Dalamud.IoC;
 using Dalamud.Plugin;
-using Dalamud.Plugin.Ipc;
 using Dalamud.Plugin.Services;
 using System.Numerics;
-using System.Text.Json;
 
-namespace IceboxRouteManager;
+namespace StockManager;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    private const string Command = "/iceboxmanager";
+    private const string Command = "/stockmanager";
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly Services services;
     private readonly Configuration config;
-    private readonly ICallGateSubscriber<string> snapshotSubscriber;
-    private readonly ICallGateSubscriber<string, int, bool> startSubscriber;
-    private readonly ICallGateSubscriber<object?> stopSubscriber;
+    private readonly ExplorersIceboxAdapter adapter = new();
 
     private IceboxSnapshot? snapshot;
     private DateTime nextPoll = DateTime.MinValue;
@@ -33,13 +29,9 @@ public sealed class Plugin : IDalamudPlugin
                    ?? throw new InvalidOperationException("Dalamud services are unavailable.");
         config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
-        snapshotSubscriber = pluginInterface.GetIpcSubscriber<string>("ExplorersIcebox.RouteManager.Snapshot");
-        startSubscriber = pluginInterface.GetIpcSubscriber<string, int, bool>("ExplorersIcebox.RouteManager.StartRoute");
-        stopSubscriber = pluginInterface.GetIpcSubscriber<object?>("ExplorersIcebox.RouteManager.Stop");
-
         services.Commands.AddHandler(Command, new CommandInfo((_, _) => windowOpen = true)
         {
-            HelpMessage = "Open Icebox Route Manager"
+            HelpMessage = "Open Stock Manager"
         });
         services.Framework.Update += OnUpdate;
         pluginInterface.UiBuilder.Draw += Draw;
@@ -47,11 +39,12 @@ public sealed class Plugin : IDalamudPlugin
         pluginInterface.UiBuilder.OpenConfigUi += OpenMainUi;
     }
 
-    public string Name => "Icebox Route Manager";
+    public string Name => "Stock Manager";
 
     public void Dispose()
     {
         config.Enabled = false;
+        adapter.Dispose();
         services.Framework.Update -= OnUpdate;
         services.Commands.RemoveHandler(Command);
         pluginInterface.UiBuilder.Draw -= Draw;
@@ -67,60 +60,63 @@ public sealed class Plugin : IDalamudPlugin
             return;
         nextPoll = DateTime.UtcNow.AddSeconds(1);
 
-        try
+        if (!adapter.TryGetSnapshot(out snapshot, out var error))
         {
-            var json = snapshotSubscriber.InvokeFunc();
-            snapshot = JsonSerializer.Deserialize<IceboxSnapshot>(json);
-            if (snapshot == null || snapshot.ApiVersion != 1)
-            {
-                status = "Incompatible ExplorersIcebox IPC version.";
-                return;
-            }
-
-            InitializeDefaults(snapshot);
-            if (!config.Enabled)
-            {
-                status = "Stopped";
-                return;
-            }
-
-            if (snapshot.IsRunning)
-            {
-                status = activeRoute == null
-                    ? $"ExplorersIcebox is running ({snapshot.State})"
-                    : $"Running: {activeRoute} ({snapshot.State})";
-                return;
-            }
-
-            if (DateTime.UtcNow < nextStartAttempt)
-                return;
-
-            var choice = SelectNextRoute(snapshot);
-            if (choice == null)
-            {
-                config.Enabled = false;
-                Save();
-                activeRoute = null;
-                status = "All configured targets have been reached.";
-                return;
-            }
-
-            if (startSubscriber.InvokeFunc(choice.Value.Route.Name, choice.Value.Loops))
-            {
-                activeRoute = choice.Value.Route.Name;
-                status = $"Starting {activeRoute}, {choice.Value.Loops} loop(s) for {choice.Value.Item.Name}.";
-                nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
-            }
-            else
-            {
-                status = "ExplorersIcebox rejected start; retrying in 5 seconds.";
-                nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
-            }
-        }
-        catch (Exception ex)
-        {
-            status = $"IPC unavailable: {ex.Message}";
+            status = error;
             snapshot = null;
+            return;
+        }
+
+        if (snapshot == null)
+        {
+            status = "ExplorersIcebox returned no route data.";
+            return;
+        }
+
+        InitializeDefaults(snapshot);
+        if (!config.Enabled)
+        {
+            status = "Stopped";
+            return;
+        }
+
+        if (!services.ClientState.IsLoggedIn)
+        {
+            status = "Log in and travel to Island Sanctuary before starting.";
+            return;
+        }
+
+        if (snapshot.IsRunning)
+        {
+            status = activeRoute == null
+                ? $"ExplorersIcebox is running ({snapshot.State})"
+                : $"Running: {activeRoute} ({snapshot.State})";
+            return;
+        }
+
+        if (DateTime.UtcNow < nextStartAttempt)
+            return;
+
+        var choice = SelectNextRoute(snapshot);
+        if (choice == null)
+        {
+            config.Enabled = false;
+            Save();
+            activeRoute = null;
+            status = "All configured targets have been reached.";
+            return;
+        }
+
+        if (adapter.TryStartRoute(choice.Value.Route, choice.Value.Loops, out error))
+        {
+            activeRoute = choice.Value.Route.Name;
+            status = $"Starting {activeRoute}, {choice.Value.Loops} loop(s) for {choice.Value.Item.Name}.";
+            nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
+        }
+        else
+        {
+            status = $"ExplorersIcebox rejected start: {error}";
+            nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
         }
     }
 
@@ -188,12 +184,13 @@ public sealed class Plugin : IDalamudPlugin
             return;
 
         ImGui.SetNextWindowSize(new Vector2(760, 620), ImGuiCond.FirstUseEver);
-        if (!ImGui.Begin("Icebox Route Manager###IceboxRouteManager", ref windowOpen))
+        if (!ImGui.Begin("Stock Manager###StockManager", ref windowOpen))
         {
             ImGui.End();
             return;
         }
 
+        ImGui.TextWrapped("Unofficial extension for ExplorersIcebox by Ice.");
         ImGui.TextWrapped(status);
         ImGui.Separator();
 
@@ -210,7 +207,7 @@ public sealed class Plugin : IDalamudPlugin
         if (ImGui.Button("Emergency stop"))
         {
             config.Enabled = false;
-            try { stopSubscriber.InvokeAction(); } catch { }
+            adapter.Stop();
             Save();
         }
 
@@ -224,7 +221,7 @@ public sealed class Plugin : IDalamudPlugin
 
         if (snapshot == null)
         {
-            ImGui.TextWrapped("Install and enable the compatible ExplorersIcebox build included with this plugin.");
+            ImGui.TextWrapped("Install and enable ExplorersIcebox from Ice's repository first.");
             ImGui.End();
             return;
         }
@@ -304,5 +301,6 @@ public sealed class Plugin : IDalamudPlugin
     {
         [PluginService] internal ICommandManager Commands { get; private init; } = null!;
         [PluginService] internal IFramework Framework { get; private init; } = null!;
+        [PluginService] internal IClientState ClientState { get; private init; } = null!;
     }
 }

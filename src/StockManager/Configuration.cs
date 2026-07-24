@@ -1,6 +1,6 @@
 using Dalamud.Configuration;
 
-namespace IceboxRouteManager;
+namespace StockManager;
 
 public sealed class Configuration : IPluginConfiguration
 {
