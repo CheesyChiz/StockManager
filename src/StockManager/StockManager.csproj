@@ -1,7 +1,7 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>1.0.0.0</Version>
-    <Description>Automatically selects ExplorersIcebox routes based on resource deficits.</Description>
+    <Version>1.0.1.0</Version>
+    <Description>Unofficial stock-balancing extension for ExplorersIcebox.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <IsPackable>true</IsPackable>
     <TargetFramework>net10.0-windows8.0</TargetFramework>
@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
-    <Content Include="IceboxRouteManager.json" />
+    <Content Include="StockManager.json" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Update="DalamudPackager" Version="15.0.0" />

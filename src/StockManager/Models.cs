@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace IceboxRouteManager;
+namespace StockManager;
 
 public sealed record IceboxSnapshot(
     [property: JsonPropertyName("ApiVersion")] int ApiVersion,
