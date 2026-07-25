@@ -26,9 +26,10 @@ Stock Manager keeps selected gathering resources at your chosen levels. It runs 
 - Optionally uses Lifestream to travel to the Island from a button or when automation starts.
 - Can stop when all managed resources reach their targets.
 - Can continue farming and export surplus materials for cowries using individual sell limits.
+- Interrupts the active gathering loop as soon as an enabled material reaches its export trigger, then sells every configured surplus in one visit.
 - Uses **Isle Return** before long exporter trips, stops the travel route at the NPC, and walks out of the cabin before trying to mount again.
 - Includes a zoomable, pannable Island map with route overlays, all-node and per-resource views, and resource tooltips.
-- Includes a clustered experimental route preview based on imported nodes.
+- Includes a separate experimental route workbench for generated previews and editable copies of imported routes.
 
 ## Requirements
 
@@ -92,7 +93,9 @@ Sell above:   800
 Export batch: 100
 ```
 
-In export mode, the resource is initially complete at 800. Stock Manager then continues farming it. As soon as any enabled resource is at 900 or higher after a route loop, the next action is a trip to the exporter. Once the shop is open, the plugin sells every resource above its individual `Sell above` value, including resources whose farming checkbox is off, and then resumes gathering. This gap prevents a new exporter trip after every route loop.
+In export mode, resources below 800 are filled first. A resource at or above 800 is no longer selected as the intentional target while another enabled resource is still below its limit, although it can still be gathered as a by-product of a useful route. Once every enabled resource has reached its retained stock, Stock Manager selects efficient overall routes for continued cowrie farming.
+
+As soon as any enabled resource reaches 900, Stock Manager interrupts the active loop and visits the exporter. Once the shop is open, the plugin sells every configured resource above its individual `Sell above` value, including resources whose farming checkbox is off, and then resumes gathering. This gap prevents a new exporter trip after every route loop.
 
 The stock value plus the export batch can never exceed the Island material cap of `999`. Invalid settings are shown in red and automation cannot start until they are corrected. A stock value of `999` is therefore valid only in **Stop** mode; export mode needs room for at least one gathered item above the sell value.
 
@@ -111,17 +114,21 @@ For a distant export trip, Stock Manager uses the Island's **Isle Return** actio
 - If flight is locked, routes named as flying routes, routes containing high-altitude-only nodes, and surface routes that require `MountFly` are ignored. Mixed surface/underwater routes remain usable and their surface transfer is downgraded to ground-mounted movement.
 - Underwater route approaches keep swimming on the surface until diving is possible, then dismount, dive, mount underwater, and ask vnavmesh for a 3D path. A manual dive is detected and causes the same mounted repath. Once Visland starts the route, Stock Manager no longer interrupts its active underwater path.
 - Optional stuck recovery measures both movement and inventory progress during the approach and active gathering loop. After the configured timeout, the route cools down for five minutes and another eligible choice is made. The supported timeout range is 8-60 seconds; a lower value would commonly fire during normal pathfinding, mounting, or gathering animations.
+- Empty on-foot transition waypoints immediately after mounted travel receive a small temporary arrival radius. This lets Visland dismount before tight shoreline or cave geometry without changing gathering-node interaction radii.
+- Imported routes with fewer than 12 unique gathering nodes prefer another useful route before repeating when one is available. Eleven nodes is the theoretical respawn minimum; the extra detour leaves room for one missed interaction.
 - Routes with no recognized Island gathering nodes are ignored.
 
 Stock Manager currently recognizes the English interaction names used by the commonly distributed Island route collection.
 
-## Experimental route generator
+## Experimental route workbench
 
-Expand **Experimental route generator** under the automatic route summary to build a temporary mixed-resource route. It finds a compact cluster that covers the checked resources, fills the route with nearby target nodes using the smallest added detour, adds support nodes only when needed for a stable 11-node loop, and orders the result into a short cycle. Nearby hops are marked for walking; longer legs use the selected mount.
+The **Routes** tab contains the route generator and editor. The generator builds a compact temporary route from gathering nodes already present in imported Visland routes. It covers the checked resources, adds nearby target nodes before distant detours, adds support nodes until the loop has a 12-node respawn safety margin, and orders the result into a short cycle. Nearby hops are marked for walking; longer legs use the selected mount.
 
-When flight is locked, flight-only source routes and high-altitude nodes are excluded from generation. That does not prove that every remaining node-to-node leg is reachable: an imported node can sit behind progression-gated terrain, and the current generator does not preserve all traversal waypoints from its source route. For safety, generated ground test loops are disabled until those legs can be navmesh-validated. The preview remains available on the map. With Island flight unlocked, use **Stop test loop** to end only the generated test, or **Emergency stop** if all automation must be aborted.
+An imported route or generated preview can be saved as an editable Stock Manager route. Its name, waypoint order, coordinates, arrival radii, movement mode, and pathfinding flag can be changed without modifying the original route in Visland. A uniquely named custom route can optionally participate in automatic selection. The editor can add the character's current position or any gathering node known from the imported route collection.
 
-The **Map** tab uses the in-game Island map texture at a fixed square aspect ratio. Imported routes and the latest generated preview are placed using the map's real size factor and offsets. Use the mouse wheel to zoom around the cursor, left-drag to pan, and **Reset view** to return to the default framing. The view selector can show one route, all registered gathering nodes, or only nodes for one resource. Hover a gathering point to see its resources and world coordinates.
+When flight is locked, flight-only source routes and high-altitude nodes are excluded from generation. That does not prove that every remaining node-to-node leg is reachable: imported data can include progression-gated cave nodes, and generated routes do not preserve every traversal waypoint from their source routes. Ground and flight test loops are therefore allowed but explicitly experimental and must be supervised. Use **Stop test loop** to end only the test, or **Emergency stop** to abort all automation.
+
+The **Map** tab uses the in-game Island map texture at a fixed square aspect ratio. Imported routes, editable Stock Manager routes, and the latest generated preview are placed using the map's real size factor and offsets. Use the mouse wheel to zoom around the cursor, left-drag to pan, and **Reset view** to return to the default framing. The view selector can show one route, all gathering nodes known from imported and editable routes, or only nodes for one resource. Hover a gathering point to see its resources and world coordinates.
 
 ## Commands
 

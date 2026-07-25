@@ -345,18 +345,22 @@ internal sealed class VislandAdapter
         if (route.Waypoints.Count == 0)
             throw new InvalidOperationException($"Route '{route.Name}' has no waypoints.");
         startIndex = Math.Clamp(startIndex, 0, route.Waypoints.Count - 1);
-        var ordered = route.Waypoints.Skip(startIndex).Concat(route.Waypoints.Take(startIndex));
+        var orderedIndices = Enumerable.Range(startIndex, route.Waypoints.Count - startIndex)
+            .Concat(Enumerable.Range(0, startIndex));
         var payload = new
         {
             route.Name,
             route.Group,
             route.Food,
             route.TargetGatherItem,
-            Waypoints = ordered.Select(waypoint => new
+            Waypoints = orderedIndices.Select(index =>
             {
+                var waypoint = route.Waypoints[index];
+                return new
+                {
                 Position = new { waypoint.Position.X, waypoint.Position.Y, waypoint.Position.Z },
                 ZoneID = waypoint.ZoneId,
-                waypoint.Radius,
+                Radius = GetEffectiveRadius(route, index),
                 Movement = (int)GetEffectiveMovement(route, waypoint, flightUnlocked),
                 waypoint.Pathfind,
                 InteractWithOID = waypoint.ObjectId,
@@ -374,9 +378,28 @@ internal sealed class VislandAdapter
                 waypoint.WaitTimeMs,
                 WaitTimeET = new { X = waypoint.WaitTimeEt.X, Y = waypoint.WaitTimeEt.Y },
                 waypoint.RouteName,
+                };
             }).ToArray(),
         };
         return Compress(JsonSerializer.Serialize(payload));
+    }
+
+    private static float GetEffectiveRadius(RouteSnapshot route, int waypointIndex)
+    {
+        var waypoint = route.Waypoints[waypointIndex];
+        var previous = route.Waypoints[(waypointIndex - 1 + route.Waypoints.Count) % route.Waypoints.Count];
+
+        // Visland does not dismount until it has entered a Normal waypoint's radius. A one-yalm pathfinding
+        // waypoint immediately after mounted travel can therefore make the mounted character jitter against
+        // shoreline, cave, or other tight geometry. Give only empty transition waypoints enough room to
+        // dismount and continue on foot; gathering-node interaction radii are left exactly as imported.
+        return waypoint.Movement == RouteMovement.Normal
+               && previous.Movement != RouteMovement.Normal
+               && waypoint.ObjectId == 0
+               && waypoint.Pathfind
+               && waypoint.Radius < 2f
+            ? 3f
+            : waypoint.Radius;
     }
 
     private static RouteMovement GetEffectiveMovement(RouteSnapshot route, RouteWaypointSnapshot waypoint, bool flightUnlocked)
