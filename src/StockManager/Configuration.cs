@@ -9,7 +9,7 @@ public sealed class Configuration : IPluginConfiguration
     public bool Enabled { get; set; }
     public bool AutoTravelToIsland { get; set; }
     public uint MountId { get; set; }
-    public ResourcePriority ResourcePriority { get; set; } = ResourcePriority.RelativeDeficit;
+    public ResourcePriority ResourcePriority { get; set; } = ResourcePriority.FastestRoute;
     public bool SkipStuckRoutes { get; set; } = true;
     public int StuckTimeoutSeconds { get; set; } = 15;
     public int BulkTarget { get; set; } = 999;

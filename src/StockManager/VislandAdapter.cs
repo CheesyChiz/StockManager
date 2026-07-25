@@ -276,6 +276,7 @@ internal sealed class VislandAdapter
     {
         var positions = new[]
         {
+            new Vector3(-268f, 40f, 226f),
             new Vector3(-267.729f, 40.000008f, 223.35608f),
             new Vector3(-267.67017f, 41f, 220.24205f),
             new Vector3(-267.57275f, 41f, 219.37453f),
