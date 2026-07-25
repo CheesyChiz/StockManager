@@ -14,12 +14,14 @@ Stock Manager keeps selected gathering resources at your chosen levels. It runs 
 
 - Uses routes already imported into Visland's `Island` group.
 - Balances resources by their relative deficit instead of repeatedly farming one fixed route.
-- Supports one shared stock value and individual per-resource values.
-- Supports ground-only routes or both ground and flying routes.
+- Enables resources independently without losing their configured stock values.
+- Selects the best compatible imported route automatically for each enabled resource.
+- Detects Island flight access and excludes flying routes and their exclusive resources when flight is locked.
 - Detects resources locked by Island progression or missing tools and ignores them automatically.
+- Optionally uses Lifestream to travel to the Island from a button or when automation starts.
 - Can stop when all managed resources reach their targets.
 - Can continue farming and export surplus materials for cowries using individual sell limits.
-- Provides independent, side-by-side resource and route lists.
+- Includes an experimental mixed-resource route generator based on nodes found in imported routes.
 
 ## Requirements
 
@@ -27,6 +29,8 @@ Stock Manager keeps selected gathering resources at your chosen levels. It runs 
 - [Visland](https://github.com/awgil/ffxiv_visland)
 - vnavmesh, as required by Visland route execution
 - Island gathering routes imported into Visland's `Island` group
+
+Optional: [Lifestream](https://github.com/NightmareXIV/Lifestream) enables the **Travel to Island** button and automatic travel on start. Stock Manager waits for the Island to finish loading before it selects or starts a route.
 
 Test every imported route manually in Visland before enabling unattended switching.
 
@@ -47,15 +51,14 @@ Installing through the custom repository provides normal Dalamud update notifica
 
 ## Quick start
 
-1. Select **Ground only** or **Ground and flying**.
-2. Enable the routes Stock Manager may use.
-3. Set the shared stock value, click **Apply**, and adjust individual resources if needed.
-4. Choose what happens after all managed resources reach their targets:
+1. Travel to your Island Sanctuary so Stock Manager can detect flight and tool access. If Lifestream is installed, use **Travel to Island** or enable automatic travel on start.
+2. Check the resources you want to farm and set their stock values. **Enable all available resources** toggles every currently farmable resource at once without changing its value.
+3. Choose what happens after all managed resources reach their targets:
    - **Stop** ends automation.
    - **Farm and export for cowries** continues gathering and sells configured surplus.
-5. Click **Start automation** while on your Island Sanctuary.
+4. Click **Start automation**. Stock Manager selects routes automatically from the imported `Island` group.
 
-Only unlocked resources served by at least one enabled, movement-compatible route participate in completion checks.
+Only enabled, unlocked resources served by at least one compatible imported route participate in completion checks.
 
 ## Stock values and exporting
 
@@ -80,12 +83,19 @@ Stock Manager owns surplus selling in export mode and automatically disables Vis
 
 ## Route rules
 
-- **Ground only** excludes every route containing a `MountFly` waypoint.
-- `MountNoFly` waypoints are ground-compatible.
-- Disabled routes do not contribute resources to completion or export decisions.
+- Routes are not enabled manually. A checked resource is the single source of truth, and Stock Manager chooses its best available route by yield and current deficits.
+- While on the Island, the game flight-access flag is detected automatically.
+- If flight is locked, every route containing a `MountFly` waypoint and resources available only through those routes are ignored.
+- `MountNoFly` waypoints remain ground-compatible.
 - Routes with no recognized Island gathering nodes are ignored.
 
 Stock Manager currently recognizes the English interaction names used by the commonly distributed Island route collection.
+
+## Experimental route generator
+
+Expand **Experimental route generator** under the automatic route summary to build a temporary mixed-resource route. It combines nodes for the checked resources, adds support nodes when needed for a stable 11-node loop, orders them into a short cycle, and lets Visland execute one supervised test loop through vnavmesh.
+
+Generated previews are not saved to Visland and are not used by normal automation yet. Their displayed length is a straight-line estimate; terrain-aware movement is handled by vnavmesh during the test. Always supervise experimental routes and use **Emergency stop** if navigation is incorrect.
 
 ## Commands
 
