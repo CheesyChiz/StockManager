@@ -59,8 +59,14 @@ public sealed class Plugin : IDalamudPlugin
         adapter = new VislandAdapter(pluginInterface);
         config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         MigrateConfiguration();
-        services.Commands.AddHandler(Command, new CommandInfo(HandleCommand) { HelpMessage = "Open or control Stock Manager. Use /sm help for commands." });
-        services.Commands.AddHandler(ShortCommand, new CommandInfo(HandleCommand) { HelpMessage = "Open or control Stock Manager. Use /sm help for commands." });
+        services.Commands.AddHandler(Command, new CommandInfo(HandleCommand)
+        {
+            HelpMessage = "Open Stock Manager. Subcommands: start, stop, status, travel, emergency, help.",
+        });
+        services.Commands.AddHandler(ShortCommand, new CommandInfo(HandleCommand)
+        {
+            HelpMessage = "Alias for /stockmanager.",
+        });
         services.Framework.Update += OnUpdate;
         pluginInterface.UiBuilder.Draw += Draw;
         pluginInterface.UiBuilder.OpenMainUi += OpenMainUi;
