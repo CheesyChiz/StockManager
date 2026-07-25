@@ -5,9 +5,9 @@
   "Description": "Automatically switches between Island gathering routes imported into Visland based on the largest relative resource deficit.",
   "RepoUrl": "https://github.com/CheesyChiz/StockManager",
   "IconUrl": "https://raw.githubusercontent.com/CheesyChiz/StockManager/main/assets/icon.png",
-  "Changelog": "Added a plugin icon and refreshed the documentation and installer metadata.",
+  "Changelog": "Unified farm and sell values into one mode-aware stock target and enforced the 999 material cap for export batches.",
   "InternalName": "StockManager",
-  "AssemblyVersion": "1.2.2.0",
+  "AssemblyVersion": "1.3.0.0",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
   "Tags": ["Island Sanctuary", "Visland", "Automation"]
