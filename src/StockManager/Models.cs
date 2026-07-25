@@ -43,6 +43,19 @@ public enum RouteMovement
     MountNoFly,
 }
 
+internal static class RouteAccessibility
+{
+    // Island underwater gathering nodes are well below sea level. Keep a little tolerance for shore approaches.
+    public const float UnderwaterY = -5f;
+
+    // The imported Island route set has ground-accessible mountain nodes below this height; the summit-only
+    // Quartz/Isleblooms nodes are above it. Route names and MountFly waypoints are also considered separately.
+    public const float FlightOnlyY = 185f;
+
+    public static bool IsUnderwater(Vector3 position) => position.Y < UnderwaterY;
+    public static bool IsFlightOnlyAltitude(Vector3 position) => position.Y >= FlightOnlyY;
+}
+
 public sealed record RouteNodeSnapshot(
     Vector3 Position,
     uint ZoneId,

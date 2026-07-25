@@ -76,16 +76,12 @@ internal sealed class VislandAdapter
                 var items = new Dictionary<int, ItemSnapshot>();
                 var routeNodes = new List<RouteNodeSnapshot>();
                 var routeWaypoints = new List<RouteWaypointSnapshot>();
-                var requiresFlying = false;
                 if (route.TryGetProperty("Waypoints", out var waypoints))
                 {
                     foreach (var waypoint in waypoints.EnumerateArray())
                     {
                         var movementName = waypoint.TryGetProperty("Movement", out var movement) ? movement.GetString() : null;
                         var routeMovement = ParseMovement(movementName);
-                        if (routeMovement == RouteMovement.MountFly)
-                            requiresFlying = true;
-
                         var position = new Vector3(
                             waypoint.TryGetProperty("X", out var x) ? x.GetSingle() : 0,
                             waypoint.TryGetProperty("Y", out var y) ? y.GetSingle() : 0,
@@ -128,6 +124,12 @@ internal sealed class VislandAdapter
                     }
                 }
 
+                var hasUnderwaterWaypoints = routeWaypoints.Any(x => RouteAccessibility.IsUnderwater(x.Position));
+                var hasFlightMovement = routeWaypoints.Any(x => x.Movement == RouteMovement.MountFly);
+                var requiresFlying = name.Contains("flying", StringComparison.OrdinalIgnoreCase)
+                                     || routeWaypoints.Any(x => RouteAccessibility.IsFlightOnlyAltitude(x.Position))
+                                     || (hasFlightMovement && !hasUnderwaterWaypoints);
+
                 if (items.Count > 0 && routeWaypoints.Count > 0)
                     routes.Add(new RouteSnapshot(
                         name,
@@ -156,11 +158,11 @@ internal sealed class VislandAdapter
         }
     }
 
-    public bool TryStartRoute(RouteSnapshot route, int startIndex, out string error)
+    public bool TryStartRoute(RouteSnapshot route, int startIndex, bool flightUnlocked, out string error)
     {
         try
         {
-            startRoute.InvokeAction(SerializeForIpc(route, startIndex), true);
+            startRoute.InvokeAction(SerializeForIpc(route, startIndex, flightUnlocked), true);
             error = string.Empty;
             return true;
         }
@@ -249,11 +251,13 @@ internal sealed class VislandAdapter
             var (count, available) = GetItemState(group.Key);
             return new ItemSnapshot(group.Key, resource.Name, group.Count(), count, available);
         }).OrderBy(x => x.Name).ToList();
-        var waypoints = nodes.Select(node => new RouteWaypointSnapshot(
+        var waypoints = nodes.Select((node, index) => new RouteWaypointSnapshot(
             node.Position,
             node.ZoneId,
             3,
-            fly ? RouteMovement.MountFly : RouteMovement.MountNoFly,
+            nodes.Count > 1 && Vector3.Distance(nodes[(index - 1 + nodes.Count) % nodes.Count].Position, node.Position) <= 18f
+                ? RouteMovement.Normal
+                : fly ? RouteMovement.MountFly : RouteMovement.MountNoFly,
             true,
             node.ObjectId,
             node.ObjectName,
@@ -335,7 +339,7 @@ internal sealed class VislandAdapter
         }
     }
 
-    internal static string SerializeForIpc(RouteSnapshot route, int startIndex)
+    internal static string SerializeForIpc(RouteSnapshot route, int startIndex, bool flightUnlocked = true)
     {
         if (route.Waypoints.Count == 0)
             throw new InvalidOperationException($"Route '{route.Name}' has no waypoints.");
@@ -352,7 +356,7 @@ internal sealed class VislandAdapter
                 Position = new { waypoint.Position.X, waypoint.Position.Y, waypoint.Position.Z },
                 ZoneID = waypoint.ZoneId,
                 waypoint.Radius,
-                Movement = (int)waypoint.Movement,
+                Movement = (int)GetEffectiveMovement(route, waypoint, flightUnlocked),
                 waypoint.Pathfind,
                 InteractWithOID = waypoint.ObjectId,
                 InteractWithName = waypoint.ObjectName,
@@ -372,6 +376,15 @@ internal sealed class VislandAdapter
             }).ToArray(),
         };
         return Compress(JsonSerializer.Serialize(payload));
+    }
+
+    private static RouteMovement GetEffectiveMovement(RouteSnapshot route, RouteWaypointSnapshot waypoint, bool flightUnlocked)
+    {
+        // Mixed land/underwater routes sometimes use MountFly for their surface transfer. They remain usable before
+        // Island flight unlock; make those surface legs ground-mounted while retaining 3D diving movement at runtime.
+        return !flightUnlocked && !route.RequiresFlying && waypoint.Movement == RouteMovement.MountFly
+            ? RouteMovement.MountNoFly
+            : waypoint.Movement;
     }
 
     private static RouteMovement ParseMovement(string? value) => value?.ToLowerInvariant() switch
@@ -423,7 +436,7 @@ internal sealed class VislandAdapter
         var manager = MJIManager.Instance();
         if (manager == null || !manager->IsPlayerInSanctuary) return null;
         var playerState = PlayerState.Instance();
-        return playerState != null && playerState->CanFly;
+        return manager->IslandState.CurrentRank >= 10 && playerState != null && playerState->CanFly;
     }
 }
 
