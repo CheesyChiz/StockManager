@@ -4,7 +4,7 @@
   "Punchline": "Balances Island Sanctuary resources with imported Visland routes.",
   "Description": "Automatically switches between Island gathering routes imported into Visland based on the largest relative resource deficit.",
   "InternalName": "StockManager",
-  "AssemblyVersion": "1.1.0.0",
+  "AssemblyVersion": "1.2.0.0",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
   "Tags": ["Island Sanctuary", "Visland", "Automation"]
