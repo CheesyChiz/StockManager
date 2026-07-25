@@ -26,7 +26,7 @@ Stock Manager keeps selected gathering resources at your chosen levels. It runs 
 - Optionally uses Lifestream to travel to the Island from a button or when automation starts.
 - Can stop when all managed resources reach their targets.
 - Can continue farming and export surplus materials for cowries using individual sell limits.
-- Includes a schematic route map and a clustered experimental route generator based on imported nodes.
+- Includes the in-game Island map texture with coordinate-accurate route overlays and a clustered experimental route generator based on imported nodes.
 
 ## Requirements
 
@@ -88,7 +88,7 @@ In export mode, the resource is initially complete at 800. Stock Manager then co
 
 The stock value plus the export batch can never exceed the Island material cap of `999`. Invalid settings are shown in red and automation cannot start until they are corrected. A stock value of `999` is therefore valid only in **Stop** mode; export mode needs room for at least one gathered item above the sell value.
 
-Stock Manager owns surplus selling in export mode and automatically disables Visland's global **Auto Export** option, so there is only one active set of export rules.
+Stock Manager owns surplus selling in export mode and automatically disables Visland's global **Auto Export** option before travelling to the shop, so there is only one active set of export rules. Visland's **Exports Automation** window may still be opened manually, but its **Auto Export** checkbox must remain off while Stock Manager is running; the plugin enforces this again before each export trip.
 
 ## Route rules
 
@@ -98,7 +98,7 @@ Stock Manager owns surplus selling in export mode and automatically disables Vis
 - When the character is already within 35 yalms of a route, the closest waypoint becomes the start of that loop. Otherwise Stock Manager approaches the route's original first waypoint.
 - While on the Island, Sanctuary Rank 10 and the game's flight-access flag are checked together.
 - If flight is locked, routes named as flying routes, routes containing high-altitude-only nodes, and surface routes that require `MountFly` are ignored. Mixed surface/underwater routes remain usable and their surface transfer is downgraded to ground-mounted movement.
-- Underwater route approaches automatically stop the old 2D path, dive, and ask vnavmesh for a 3D path. A manual dive is detected and causes the same repath.
+- Underwater route approaches keep swimming on the surface until diving is possible, then dismount, dive, mount underwater, and ask vnavmesh for a 3D path. A manual dive is detected and causes the same mounted repath. Once Visland starts the route, Stock Manager no longer interrupts its active underwater path.
 - Optional stuck recovery measures progress toward the route start. After the configured timeout, the route cools down for five minutes and another eligible choice is made.
 - Routes with no recognized Island gathering nodes are ignored.
 
@@ -110,7 +110,7 @@ Expand **Experimental route generator** under the automatic route summary to bui
 
 When flight is locked, flight-only source routes and high-altitude nodes are excluded from generation. Generated previews are not saved to Visland and are not used by normal automation yet. Their displayed length is a straight-line estimate; terrain-aware movement is handled by vnavmesh during the test. Use **Stop test loop** to end only the generated test, or **Emergency stop** if all automation must be aborted.
 
-The **Map** tab plots imported routes and the latest generated preview in Island world coordinates. It shows waypoint links, walking/mounted/flying/underwater movement, gathering nodes, the player position, and hover details. This first version is a schematic coordinate view rather than the in-game map texture.
+The **Map** tab uses the in-game Island map texture at a fixed square aspect ratio. Imported routes and the latest generated preview are placed using the map's real size factor and offsets; the overlay shows waypoint links, walking/mounted/flying/underwater movement, gathering nodes, the player position, and hover coordinates.
 
 ## Commands
 

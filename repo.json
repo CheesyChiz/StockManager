@@ -3,11 +3,11 @@
     "Author": "CheesyChiz",
     "Name": "Stock Manager",
     "Punchline": "Balances Island Sanctuary stock with imported Visland routes.",
-    "Description": "Choose Island resources and stock levels, then let Stock Manager select imported Visland routes. Supports sortable resources, farming priorities, flight and underwater navigation, a route map, mount override, stuck recovery, Lifestream, surplus export, run statistics, and /sm commands.",
+    "Description": "Choose Island resources and stock levels, then let Stock Manager select imported Visland routes. Supports sortable resources, farming priorities, flight and underwater navigation, an Island route map, mount override, stuck recovery, Lifestream, surplus export, run statistics, and /sm commands.",
     "IconUrl": "https://raw.githubusercontent.com/CheesyChiz/StockManager/main/assets/icon.png",
-    "Changelog": "Fixed flight-only route selection, swimming/dive navigation, and immediate surplus export checks. Completed Stop targets now leave the active set without restarting; export visits sell every configured surplus. Added a route map, sorting, priorities, mount override, stuck recovery, and clustered generated routes.",
+    "Changelog": "Fixed underwater approaches: surface swimming now continues until diving succeeds, manual dives rebuild a mounted 3D path, and active Visland paths are no longer interrupted. Added the real Island map texture with coordinate-accurate route overlays. Visland Auto Export is now disabled defensively before every Stock Manager export trip.",
     "InternalName": "StockManager",
-    "AssemblyVersion": "1.5.0.0",
+    "AssemblyVersion": "1.5.1.0",
     "TestingAssemblyVersion": null,
     "RepoUrl": "https://github.com/CheesyChiz/StockManager",
     "ApplicableVersion": "any",
@@ -19,9 +19,9 @@
     ],
     "IsHide": false,
     "IsTestingExclusive": false,
-    "DownloadLinkInstall": "https://github.com/CheesyChiz/StockManager/releases/download/v1.5.0/StockManager.zip",
-    "DownloadLinkUpdate": "https://github.com/CheesyChiz/StockManager/releases/download/v1.5.0/StockManager.zip",
+    "DownloadLinkInstall": "https://github.com/CheesyChiz/StockManager/releases/download/v1.5.1/StockManager.zip",
+    "DownloadLinkUpdate": "https://github.com/CheesyChiz/StockManager/releases/download/v1.5.1/StockManager.zip",
     "DownloadLinkTesting": null,
-    "LastUpdate": 1784951627
+    "LastUpdate": 1784957723
   }
 ]
