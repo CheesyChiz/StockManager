@@ -5,6 +5,7 @@ using FFXIVClientStructs.FFXIV.Client.Game.MJI;
 using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
+using System.Reflection;
 
 namespace StockManager;
 
@@ -135,6 +136,37 @@ internal sealed class VislandAdapter
     {
         try { stopRoute.InvokeAction(); }
         catch { }
+    }
+
+    public bool TryDisableBuiltInAutoExport(out string error)
+    {
+        try
+        {
+            var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(x => x.GetName().Name == "visland")
+                           ?? throw new InvalidOperationException("Visland is not loaded.");
+            var serviceType = assembly.GetType("visland.Service", true)!;
+            var exportType = assembly.GetType("visland.Export.ExportConfig", true)!;
+            var configuration = serviceType.GetProperty("Config", BindingFlags.Public | BindingFlags.Static)?.GetValue(null)
+                                ?? throw new MissingMemberException("visland.Service.Config");
+            var getNode = configuration.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .Single(x => x.Name == "Get" && x.IsGenericMethodDefinition && x.GetParameters().Length == 0)
+                .MakeGenericMethod(exportType);
+            var exportConfig = getNode.Invoke(configuration, null) ?? throw new InvalidOperationException("Visland export configuration is unavailable.");
+            var autoSell = exportType.GetField("AutoSell", BindingFlags.Public | BindingFlags.Instance)
+                           ?? throw new MissingFieldException(exportType.FullName, "AutoSell");
+            if ((bool)(autoSell.GetValue(exportConfig) ?? false))
+            {
+                autoSell.SetValue(exportConfig, false);
+                exportType.GetMethod("NotifyModified", BindingFlags.Public | BindingFlags.Instance)?.Invoke(exportConfig, null);
+            }
+            error = string.Empty;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.GetBaseException().Message;
+            return false;
+        }
     }
 
     private static string Compress(string json)

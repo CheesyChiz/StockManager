@@ -37,7 +37,7 @@ Then open `/xlplugins`, install **Stock Manager**, and open it with `/stockmanag
 - **Stop** disables automation when every available target has been reached.
 - **Farm and export for cowries** keeps gathering after the targets are reached. Each resource has an independent **Sell above** value. Stock Manager visits the exporter only after the resource reaches `Sell above + Minimum export batch`, sells it back down to **Sell above**, and resumes gathering.
 
-For example, `Sell above = 800` and `Minimum export batch = 100` means the exporter is visited at 900 and the resource is sold back to 800. This hysteresis prevents an exporter trip after every gathering loop. **Visland Auto Export must be disabled** because its global limit would conflict with Stock Manager's per-resource limits.
+For example, `Sell above = 800` and `Minimum export batch = 100` means the exporter is visited at 900 and the resource is sold back to 800. This hysteresis prevents an exporter trip after every gathering loop. Stock Manager automatically disables Visland's built-in Auto Export when this mode is active, making the per-resource Stock Manager settings the single source of truth.
 
 Imported routes are read from Visland's own configuration. Stock Manager currently recognizes Island gathering nodes by their English interaction names, as stored by the commonly distributed Island route collection.
 

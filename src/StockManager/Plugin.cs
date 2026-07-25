@@ -80,12 +80,17 @@ public sealed class Plugin : IDalamudPlugin
             }
             if (snapshot.AutoExportEnabled)
             {
-                status = "Disable Visland Auto Export: Stock Manager uses per-resource export limits.";
+                if (!adapter.TryDisableBuiltInAutoExport(out error))
+                {
+                    status = $"Could not take over Visland Auto Export: {error}";
+                    return;
+                }
+                status = "Stock Manager disabled Visland Auto Export and took over surplus selling.";
                 return;
             }
             var cowrieRoute = SelectCowrieRoute(snapshot);
             if (cowrieRoute == null) { status = "No compatible unlocked resource routes are enabled."; return; }
-            var exportDue = UniqueItems(snapshot).Where(IsExportDue).OrderByDescending(x => x.CurrentCount - config.SellLimits[x.Id]).FirstOrDefault();
+            var exportDue = ManagedItems(snapshot).Where(IsExportDue).OrderByDescending(x => x.CurrentCount - config.SellLimits[x.Id]).FirstOrDefault();
             if (exportDue != null)
             {
                 if (adapter.TryStartExportTrip(out error))
@@ -143,6 +148,9 @@ public sealed class Plugin : IDalamudPlugin
 
     private static IEnumerable<ItemSnapshot> UniqueItems(VislandSnapshot data) =>
         data.Routes.SelectMany(x => x.Items).GroupBy(x => x.Id).Select(x => x.First());
+
+    private IEnumerable<ItemSnapshot> ManagedItems(VislandSnapshot data) =>
+        CompatibleRoutes(data).SelectMany(x => x.Items).GroupBy(x => x.Id).Select(x => x.First());
 
     private double RouteUtility(RouteSnapshot route) => route.Items.Sum(item =>
         item.IsAvailable && config.Targets.TryGetValue(item.Id, out var target) && target > 0 && item.CurrentCount < target
@@ -237,7 +245,7 @@ public sealed class Plugin : IDalamudPlugin
         var batch = config.ExportBatch; ImGui.SetNextItemWidth(90);
         if (ImGui.InputInt("Minimum export batch", ref batch)) { config.ExportBatch = Math.Clamp(batch, 1, 999); Save(); }
         ImGui.TextDisabled("Example: Sell above 800 + batch 100 = visit at 900, sell back to 800.");
-        if (snapshot?.AutoExportEnabled == true) ImGui.TextColored(new Vector4(1f, .45f, .3f, 1), "Disable Visland Auto Export to avoid conflicting global limits.");
+        ImGui.TextDisabled("Stock Manager automatically disables Visland Auto Export in this mode.");
     }
 
     private void DrawRoutes(VislandSnapshot data)
