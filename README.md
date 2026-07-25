@@ -14,7 +14,7 @@ Stock Manager keeps selected gathering resources at your chosen levels. It runs 
 
 - Uses routes already imported into Visland's `Island` group.
 - Balances resources by their relative deficit instead of repeatedly farming one fixed route.
-- Supports one-click targets and individual per-resource targets.
+- Supports one shared stock value and individual per-resource values.
 - Supports ground-only routes or both ground and flying routes.
 - Detects resources locked by Island progression or missing tools and ignores them automatically.
 - Can stop when all managed resources reach their targets.
@@ -49,7 +49,7 @@ Installing through the custom repository provides normal Dalamud update notifica
 
 1. Select **Ground only** or **Ground and flying**.
 2. Enable the routes Stock Manager may use.
-3. Set **Farm target for all**, click **Apply**, and adjust individual resources if needed.
+3. Set the shared stock value, click **Apply**, and adjust individual resources if needed.
 4. Choose what happens after all managed resources reach their targets:
    - **Stop** ends automation.
    - **Farm and export for cowries** continues gathering and sells configured surplus.
@@ -57,25 +57,24 @@ Installing through the custom repository provides normal Dalamud update notifica
 
 Only unlocked resources served by at least one enabled, movement-compatible route participate in completion checks.
 
-## Targets and exporting
+## Stock values and exporting
 
 | Setting | Meaning |
 | --- | --- |
-| **Farm** | Minimum desired stock. `0` disables the resource as a balancing target. |
-| **Sell above** | Amount retained after exporting. `999` effectively disables selling that resource. |
-| **Minimum export batch** | Extra stock required before travelling to the exporter. |
+| **Target stock** | In **Stop** mode, the amount that must be gathered before the resource is complete. |
+| **Sell above** | The same stock value in export mode: the amount retained whenever surplus is sold. |
+| **Export batch** | Extra stock required before travelling to the exporter. |
 
 Example:
 
 ```text
-Farm:                 99
-Sell above:          800
-Minimum export batch: 100
+Sell above:   800
+Export batch: 100
 ```
 
-The resource remains complete after reaching 99. In export mode, Stock Manager continues farming it, visits the exporter at 900, sells it back to 800, and resumes gathering. This gap prevents a new exporter trip after every route loop.
+In export mode, the resource is initially complete at 800. Stock Manager then continues farming it, visits the exporter at 900, sells it back to 800, and resumes gathering. This gap prevents a new exporter trip after every route loop.
 
-`Sell above` can never be lower than `Farm`. Raising a farm target automatically raises an incompatible sell limit.
+The stock value plus the export batch can never exceed the Island material cap of `999`. Invalid settings are shown in red and automation cannot start until they are corrected. A resource set to `999` can be completed normally but is excluded from continued export farming.
 
 Stock Manager owns surplus selling in export mode and automatically disables Visland's global **Auto Export** option, so there is only one active set of export rules.
 

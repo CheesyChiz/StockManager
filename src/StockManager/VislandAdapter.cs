@@ -84,13 +84,11 @@ internal sealed class VislandAdapter
             }
 
             var autoExport = false;
-            var exportLimit = 999;
             if (payload.TryGetProperty("visland.Export.ExportConfig", out var exportConfig))
             {
                 autoExport = exportConfig.TryGetProperty("AutoSell", out var autoSell) && autoSell.GetBoolean();
-                exportLimit = exportConfig.TryGetProperty("NormalLimit", out var normalLimit) ? normalLimit.GetInt32() : 999;
             }
-            snapshot = new VislandSnapshot(isRouteRunning.InvokeFunc(), autoExport, exportLimit, routes);
+            snapshot = new VislandSnapshot(isRouteRunning.InvokeFunc(), autoExport, routes);
             error = string.Empty;
             return true;
         }
