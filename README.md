@@ -106,13 +106,15 @@ Generated previews are not saved to Visland and are not used by normal automatio
 
 | Command | Action |
 | --- | --- |
-| `/stockmanager` or `/sm` | Open the Stock Manager window. |
-| `/sm start` | Start automation and reset the collection statistics for this run. |
-| `/sm stop` | Stop automation and the current route. |
-| `/sm status` | Print the current state, active route, elapsed time, and resources collected this run. |
-| `/sm travel` | Ask Lifestream to travel to the Island. |
-| `/sm emergency` | Stop Stock Manager, Visland, vnavmesh, and active Lifestream travel immediately. |
-| `/sm help` | Print the command list. |
+| `/stockmanager` | Open the Stock Manager window. |
+| `/stockmanager start` | Start automation and reset the collection statistics for this run. |
+| `/stockmanager stop` | Stop automation and the current route. |
+| `/stockmanager status` | Print the current state, active route, elapsed time, and resources collected this run. |
+| `/stockmanager travel` | Ask Lifestream to travel to the Island. |
+| `/stockmanager emergency` | Stop Stock Manager, Visland, vnavmesh, and active Lifestream travel immediately. |
+| `/stockmanager help` | Print the command list. |
+
+`/sm` is an alias for `/stockmanager`; every subcommand works with either form.
 
 Session statistics count positive inventory changes while automation is active, so gathered materials remain in the total even after Stock Manager exports the surplus.
 
