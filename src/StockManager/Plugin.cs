@@ -29,11 +29,19 @@ public sealed class Plugin : IDalamudPlugin
     private bool exportTrip;
     private bool exportSubmitted;
     private bool travelRequested;
+    private bool experimentalTestRunning;
     private string status = "Waiting for Visland...";
     private string? activeRoute;
+    private PendingRouteStart? pendingRouteStart;
+    private DateTime navigationStartedAt;
     private RouteSnapshot? experimentalRoute;
     private string experimentalStatus = "Uses enabled resources and nodes found in imported Visland routes.";
     private int experimentalNodeLimit = 18;
+    private readonly Dictionary<int, int> sessionLastCounts = new();
+    private readonly Dictionary<int, int> sessionCollected = new();
+    private DateTime? sessionStartedAt;
+    private DateTime? sessionEndedAt;
+    private bool sessionTracking;
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
@@ -42,8 +50,8 @@ public sealed class Plugin : IDalamudPlugin
         adapter = new VislandAdapter(pluginInterface);
         config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         MigrateConfiguration();
-        services.Commands.AddHandler(Command, new CommandInfo((_, _) => windowOpen = true) { HelpMessage = "Open Stock Manager" });
-        services.Commands.AddHandler(ShortCommand, new CommandInfo((_, _) => windowOpen = true) { HelpMessage = "Open Stock Manager" });
+        services.Commands.AddHandler(Command, new CommandInfo(HandleCommand) { HelpMessage = "Open or control Stock Manager. Use /sm help for commands." });
+        services.Commands.AddHandler(ShortCommand, new CommandInfo(HandleCommand) { HelpMessage = "Open or control Stock Manager. Use /sm help for commands." });
         services.Framework.Update += OnUpdate;
         pluginInterface.UiBuilder.Draw += Draw;
         pluginInterface.UiBuilder.OpenMainUi += OpenMainUi;
@@ -64,6 +72,48 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     private void OpenMainUi() => windowOpen = true;
+
+    private void HandleCommand(string _, string arguments)
+    {
+        var verb = arguments.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.ToLowerInvariant() ?? string.Empty;
+        switch (verb)
+        {
+            case "":
+            case "open":
+                windowOpen = true;
+                break;
+            case "start":
+                TryStartAutomation();
+                services.ChatGui.Print($"[Stock Manager] {status}");
+                break;
+            case "stop":
+                StopAutomation(false, "Stopped by command.");
+                services.ChatGui.Print("[Stock Manager] Automation stopped.");
+                break;
+            case "emergency":
+                StopAutomation(true, "Emergency stop requested.");
+                services.ChatGui.Print("[Stock Manager] Emergency stop completed.");
+                break;
+            case "travel":
+                if (adapter.TryTravelToIsland(out var error))
+                {
+                    travelRequested = true;
+                    status = "Lifestream is taking you to your Island Sanctuary...";
+                }
+                else status = $"Could not travel with Lifestream: {error}";
+                services.ChatGui.Print($"[Stock Manager] {status}");
+                break;
+            case "status":
+                PrintSessionStatus();
+                break;
+            case "help":
+                services.ChatGui.Print("[Stock Manager] /sm [open|start|stop|status|travel|emergency|help]");
+                break;
+            default:
+                services.ChatGui.Print($"[Stock Manager] Unknown command '{verb}'. Use /sm help.");
+                break;
+        }
+    }
 
     private void MigrateConfiguration()
     {
@@ -89,6 +139,32 @@ public sealed class Plugin : IDalamudPlugin
         if (snapshot == null) { status = "Visland returned no route data."; return; }
         InitializeDefaults(snapshot);
         MigrateRouteSelections(snapshot);
+        if (config.Enabled && sessionStartedAt == null) BeginSession(snapshot);
+        UpdateSessionStats(snapshot);
+        if (pendingRouteStart != null)
+        {
+            if (!services.ClientState.IsLoggedIn || snapshot.FlightUnlocked == null)
+            {
+                adapter.StopNavigation();
+                pendingRouteStart = null;
+                activeRoute = null;
+                status = "Route start cancelled because the Island is no longer available.";
+            }
+            else HandlePendingRouteStart(snapshot);
+            return;
+        }
+        if (experimentalTestRunning)
+        {
+            if (snapshot.IsRunning) status = $"Running experimental test: {activeRoute}";
+            else
+            {
+                experimentalTestRunning = false;
+                activeRoute = null;
+                status = "Experimental test loop complete.";
+                experimentalStatus = status;
+            }
+            return;
+        }
         if (!config.Enabled) { status = "Stopped"; return; }
         if (!services.ClientState.IsLoggedIn) { status = "Log in and travel to Island Sanctuary before starting."; return; }
         if (snapshot.FlightUnlocked == null)
@@ -114,7 +190,7 @@ public sealed class Plugin : IDalamudPlugin
         travelRequested = false;
         if (TryGetStartValidationError(snapshot, out var validationError))
         {
-            config.Enabled = false; adapter.Stop(); Save(); status = validationError; return;
+            config.Enabled = false; adapter.Stop(); EndSession(); Save(); status = validationError; return;
         }
         if (exportTrip && HandleExportTrip(snapshot)) return;
         if (snapshot.IsRunning) { status = activeRoute == null ? "Visland is running a route" : $"Running: {activeRoute}"; return; }
@@ -125,7 +201,7 @@ public sealed class Plugin : IDalamudPlugin
         {
             if (config.CompletionAction == CompletionAction.Stop)
             {
-                config.Enabled = false; activeRoute = null; Save();
+                config.Enabled = false; activeRoute = null; EndSession(); Save();
                 status = "All available targets have been reached.";
                 return;
             }
@@ -144,26 +220,204 @@ public sealed class Plugin : IDalamudPlugin
             var exportDue = ManagedItems(snapshot).Where(IsExportDue).OrderByDescending(x => x.CurrentCount - config.Targets[x.Id]).FirstOrDefault();
             if (exportDue != null)
             {
-                if (adapter.TryStartExportTrip(out error))
-                {
-                    exportTrip = true; exportSubmitted = false; exportTripStarted = DateTime.UtcNow; closeExportAfter = DateTime.MaxValue;
-                    activeRoute = "Export materials";
-                    status = $"{exportDue.Name} reached {exportDue.CurrentCount}; going to export configured surplus.";
-                }
-                else status = $"Could not start export trip: {error}";
+                QueueRouteStart(adapter.CreateExportTripRoute(), exportDue.Name, PendingRoutePurpose.Export);
                 nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
                 return;
             }
             choice = cowrieRoute;
         }
 
-        if (adapter.TryStartRoute(choice.Value.Route, out error))
-        {
-            activeRoute = choice.Value.Route.Name;
-            status = $"Starting {activeRoute} for {choice.Value.Item.Name}.";
-        }
-        else status = $"Visland rejected start: {error}";
+        QueueRouteStart(choice.Value.Route, choice.Value.Item.Name, PendingRoutePurpose.Farm);
         nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
+    }
+
+    private void TryStartAutomation()
+    {
+        if (config.Enabled)
+        {
+            status = "Automation is already active.";
+            return;
+        }
+        if (snapshot == null)
+        {
+            status = "Waiting for Visland route data.";
+            return;
+        }
+        if (TryGetStartValidationError(snapshot, out var error))
+        {
+            status = error;
+            return;
+        }
+
+        config.Enabled = true;
+        exportTrip = false;
+        travelRequested = false;
+        activeRoute = null;
+        pendingRouteStart = null;
+        experimentalTestRunning = false;
+        nextStartAttempt = DateTime.MinValue;
+        BeginSession(snapshot);
+        Save();
+        status = snapshot.FlightUnlocked == null && config.AutoTravelToIsland
+            ? "Starting automation and preparing Island travel..."
+            : "Automation started.";
+    }
+
+    private void StopAutomation(bool emergency, string message)
+    {
+        var wasTravelRequested = travelRequested;
+        config.Enabled = false;
+        exportTrip = false;
+        exportSubmitted = false;
+        travelRequested = false;
+        pendingRouteStart = null;
+        experimentalTestRunning = false;
+        activeRoute = null;
+        adapter.Stop();
+        if (emergency || wasTravelRequested) adapter.AbortLifestream();
+        EndSession();
+        Save();
+        status = message;
+    }
+
+    private bool QueueRouteStart(RouteSnapshot route, string? itemName, PendingRoutePurpose purpose)
+    {
+        var player = services.Objects.LocalPlayer;
+        if (player == null)
+        {
+            status = "The local player is unavailable.";
+            if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            return false;
+        }
+        if (!adapter.TryNavigateToStart(route, player.Position, out var error))
+        {
+            status = $"Could not navigate to the start of {route.Name}: {error}";
+            if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            return false;
+        }
+
+        pendingRouteStart = new PendingRouteStart(route, itemName, purpose);
+        navigationStartedAt = DateTime.UtcNow;
+        activeRoute = route.Name;
+        status = $"Navigating with vnavmesh to the start of {route.Name}...";
+        if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+        return true;
+    }
+
+    private void HandlePendingRouteStart(VislandSnapshot data)
+    {
+        var pending = pendingRouteStart;
+        if (pending == null) return;
+        if (DateTime.UtcNow - navigationStartedAt > TimeSpan.FromMinutes(2))
+        {
+            adapter.StopNavigation();
+            pendingRouteStart = null;
+            activeRoute = null;
+            status = $"Timed out navigating to the start of {pending.Route.Name}.";
+            if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
+            return;
+        }
+
+        status = $"Navigating with vnavmesh to the start of {pending.Route.Name}...";
+        if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+        if (DateTime.UtcNow - navigationStartedAt < TimeSpan.FromSeconds(1) || data.IsRunning) return;
+
+        var player = services.Objects.LocalPlayer;
+        var arrivalRadius = Math.Max(5f, pending.Route.Start.Radius + 2f);
+        if (player == null || Vector3.Distance(player.Position, pending.Route.Start.Position) > arrivalRadius)
+        {
+            pendingRouteStart = null;
+            activeRoute = null;
+            status = $"vnavmesh stopped before reaching the start of {pending.Route.Name}.";
+            if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
+            return;
+        }
+
+        pendingRouteStart = null;
+        if (!adapter.TryStartRoute(pending.Route, out var error))
+        {
+            activeRoute = null;
+            status = $"Visland rejected start: {error}";
+            if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
+            return;
+        }
+
+        switch (pending.Purpose)
+        {
+            case PendingRoutePurpose.Export:
+                exportTrip = true;
+                exportSubmitted = false;
+                exportTripStarted = DateTime.UtcNow;
+                closeExportAfter = DateTime.MaxValue;
+                status = $"{pending.ItemName} reached its export threshold; going to export configured surplus.";
+                break;
+            case PendingRoutePurpose.Experimental:
+                experimentalTestRunning = true;
+                status = "Experimental test loop started in Visland. Use Emergency stop if needed.";
+                experimentalStatus = status;
+                break;
+            default:
+                status = $"Starting {pending.Route.Name} for {pending.ItemName}.";
+                break;
+        }
+    }
+
+    private void BeginSession(VislandSnapshot data)
+    {
+        sessionLastCounts.Clear();
+        sessionCollected.Clear();
+        foreach (var item in UniqueItems(data)) sessionLastCounts[item.Id] = item.CurrentCount;
+        sessionStartedAt = DateTime.UtcNow;
+        sessionEndedAt = null;
+        sessionTracking = true;
+    }
+
+    private void UpdateSessionStats(VislandSnapshot data)
+    {
+        if (!sessionTracking) return;
+        foreach (var item in UniqueItems(data))
+        {
+            if (sessionLastCounts.TryGetValue(item.Id, out var previous) && item.CurrentCount > previous)
+                sessionCollected[item.Id] = sessionCollected.GetValueOrDefault(item.Id) + item.CurrentCount - previous;
+            sessionLastCounts[item.Id] = item.CurrentCount;
+        }
+    }
+
+    private void EndSession()
+    {
+        if (sessionTracking) sessionEndedAt = DateTime.UtcNow;
+        sessionTracking = false;
+    }
+
+    private void PrintSessionStatus()
+    {
+        services.ChatGui.Print($"[Stock Manager] {status}" + (activeRoute == null ? string.Empty : $" Route: {activeRoute}."));
+        if (sessionStartedAt == null)
+        {
+            services.ChatGui.Print("[Stock Manager] No collection session has been started yet.");
+            return;
+        }
+
+        var end = sessionEndedAt ?? DateTime.UtcNow;
+        var duration = end - sessionStartedAt.Value;
+        var names = snapshot == null
+            ? new Dictionary<int, string>()
+            : UniqueItems(snapshot).ToDictionary(x => x.Id, x => x.Name);
+        var collected = sessionCollected.Where(x => x.Value > 0).OrderByDescending(x => x.Value)
+            .Select(x => $"{names.GetValueOrDefault(x.Key, x.Key.ToString())} +{x.Value}").ToList();
+        var total = sessionCollected.Values.Sum();
+        var elapsed = duration.TotalHours >= 1 ? duration.ToString(@"h\:mm\:ss") : duration.ToString(@"m\:ss");
+        if (collected.Count == 0)
+        {
+            services.ChatGui.Print($"[Stock Manager] This run: {elapsed}; nothing collected yet.");
+            return;
+        }
+        services.ChatGui.Print($"[Stock Manager] This run: {elapsed}, {total} total.");
+        foreach (var group in collected.Chunk(6))
+            services.ChatGui.Print($"[Stock Manager] {string.Join(", ", group)}.");
     }
 
     private void MigrateRouteSelections(VislandSnapshot data)
@@ -211,7 +465,7 @@ public sealed class Plugin : IDalamudPlugin
         error = string.Empty;
         if (config.CompletionAction != CompletionAction.FarmAndExport) return false;
         var invalid = ManagedItems(data)
-            .Where(x => config.Targets.TryGetValue(x.Id, out var target) && target is > 0 and < 999)
+            .Where(x => x.IsAvailable && config.Targets.TryGetValue(x.Id, out var target) && target > 0)
             .Select(x => new { Item = x, Target = config.Targets[x.Id], Total = config.Targets[x.Id] + config.ExportBatch })
             .Where(x => x.Total > 999).OrderByDescending(x => x.Total).FirstOrDefault();
         if (invalid == null) return false;
@@ -270,19 +524,11 @@ public sealed class Plugin : IDalamudPlugin
         ImGui.SameLine(); ImGui.TextWrapped(status);
         if (ImGui.Button(config.Enabled ? "Stop automation" : "Start automation"))
         {
-            var wantsEnabled = !config.Enabled;
-            if (wantsEnabled && snapshot != null && TryGetStartValidationError(snapshot, out var error))
-                status = error;
-            else
-            {
-                var wasTravelRequested = travelRequested;
-                config.Enabled = wantsEnabled; exportTrip = false; travelRequested = false; activeRoute = null; nextStartAttempt = DateTime.MinValue;
-                if (!config.Enabled) { adapter.Stop(); if (wasTravelRequested) adapter.AbortLifestream(); }
-                Save();
-            }
+            if (config.Enabled) StopAutomation(false, "Stopped");
+            else TryStartAutomation();
         }
         ImGui.SameLine();
-        if (ImGui.Button("Emergency stop")) { config.Enabled = false; exportTrip = false; adapter.Stop(); adapter.AbortLifestream(); travelRequested = false; Save(); }
+        if (ImGui.Button("Emergency stop")) StopAutomation(true, "Emergency stop requested.");
         ImGui.SameLine();
         var canTravel = snapshot?.FlightUnlocked == null && adapter.IsLifestreamAvailable && !adapter.IsLifestreamBusy;
         if (!canTravel) ImGui.BeginDisabled();
@@ -417,7 +663,8 @@ public sealed class Plugin : IDalamudPlugin
         if (ImGui.InputInt("Maximum nodes", ref limit)) experimentalNodeLimit = Math.Clamp(limit, 11, 30);
         ImGui.TextDisabled("At least 11 unique nodes are used to support Island node respawns.");
 
-        var canGenerate = data.FlightUnlocked != null && !config.Enabled && !data.IsRunning;
+        var canGenerate = data.FlightUnlocked != null && !config.Enabled && !data.IsRunning
+                          && pendingRouteStart == null && !experimentalTestRunning;
         if (!canGenerate) ImGui.BeginDisabled();
         if (ImGui.Button("Generate preview")) GenerateExperimentalRoute(data);
         if (!canGenerate) ImGui.EndDisabled();
@@ -426,9 +673,7 @@ public sealed class Plugin : IDalamudPlugin
         if (!canRun) ImGui.BeginDisabled();
         if (ImGui.Button("Run one test loop") && experimentalRoute != null)
         {
-            if (adapter.TryStartRoute(experimentalRoute, out var error))
-                experimentalStatus = "Test loop started in Visland. Use Emergency stop if needed.";
-            else experimentalStatus = $"Visland rejected the generated route: {error}";
+            QueueRouteStart(experimentalRoute, null, PendingRoutePurpose.Experimental);
         }
         if (!canRun) ImGui.EndDisabled();
         ImGui.TextWrapped(experimentalStatus);
@@ -627,11 +872,22 @@ public sealed class Plugin : IDalamudPlugin
 
     private void Save() => pluginInterface.SavePluginConfig(config);
 
+    private enum PendingRoutePurpose
+    {
+        Farm,
+        Export,
+        Experimental,
+    }
+
+    private sealed record PendingRouteStart(RouteSnapshot Route, string? ItemName, PendingRoutePurpose Purpose);
+
     private sealed class Services
     {
         [PluginService] internal ICommandManager Commands { get; private init; } = null!;
         [PluginService] internal IFramework Framework { get; private init; } = null!;
         [PluginService] internal IClientState ClientState { get; private init; } = null!;
+        [PluginService] internal IObjectTable Objects { get; private init; } = null!;
         [PluginService] internal IGameGui GameGui { get; private init; } = null!;
+        [PluginService] internal IChatGui ChatGui { get; private init; } = null!;
     }
 }

@@ -17,6 +17,7 @@ internal sealed class VislandAdapter
     private readonly ICallGateSubscriber<string, bool, object> startRoute;
     private readonly ICallGateSubscriber<object> stopRoute;
     private readonly ICallGateSubscriber<bool> navmeshReady;
+    private readonly ICallGateSubscriber<object> navmeshStop;
     private readonly ICallGateSubscriber<string, object> lifestreamExecute;
     private readonly ICallGateSubscriber<bool> lifestreamBusy;
     private readonly ICallGateSubscriber<object> lifestreamAbort;
@@ -28,6 +29,7 @@ internal sealed class VislandAdapter
         startRoute = pluginInterface.GetIpcSubscriber<string, bool, object>("visland.StartRoute");
         stopRoute = pluginInterface.GetIpcSubscriber<object>("visland.StopRoute");
         navmeshReady = pluginInterface.GetIpcSubscriber<bool>("vnavmesh.Nav.IsReady");
+        navmeshStop = pluginInterface.GetIpcSubscriber<object>("vnavmesh.Path.Stop");
         lifestreamExecute = pluginInterface.GetIpcSubscriber<string, object>("Lifestream.ExecuteCommand");
         lifestreamBusy = pluginInterface.GetIpcSubscriber<bool>("Lifestream.IsBusy");
         lifestreamAbort = pluginInterface.GetIpcSubscriber<object>("Lifestream.Abort");
@@ -67,13 +69,23 @@ internal sealed class VislandAdapter
                 var items = new Dictionary<int, ItemSnapshot>();
                 var routeNodes = new List<RouteNodeSnapshot>();
                 var requiresFlying = false;
+                RouteStartSnapshot? start = null;
                 if (route.TryGetProperty("Waypoints", out var waypoints))
                 {
                     foreach (var waypoint in waypoints.EnumerateArray())
                     {
-                        if (waypoint.TryGetProperty("Movement", out var movement)
-                            && movement.GetString()?.Equals("MountFly", StringComparison.OrdinalIgnoreCase) == true)
+                        var movementName = waypoint.TryGetProperty("Movement", out var movement) ? movement.GetString() : null;
+                        if (movementName?.Equals("MountFly", StringComparison.OrdinalIgnoreCase) == true)
                             requiresFlying = true;
+
+                        var position = new Vector3(
+                            waypoint.TryGetProperty("X", out var x) ? x.GetSingle() : 0,
+                            waypoint.TryGetProperty("Y", out var y) ? y.GetSingle() : 0,
+                            waypoint.TryGetProperty("Z", out var z) ? z.GetSingle() : 0);
+                        start ??= new RouteStartSnapshot(
+                            position,
+                            waypoint.TryGetProperty("Radius", out var radius) ? Math.Max(1, radius.GetSingle()) : 3,
+                            movementName?.Equals("MountFly", StringComparison.OrdinalIgnoreCase) == true);
 
                         if (!waypoint.TryGetProperty("InteractWithName", out var nodeElement))
                             continue;
@@ -87,10 +99,6 @@ internal sealed class VislandAdapter
                                 ? existing with { PerLoop = existing.PerLoop + 1, CurrentCount = count, IsAvailable = available }
                                 : new ItemSnapshot(resource.Id, resource.Name, 1, count, available);
                         }
-                        var position = new Vector3(
-                            waypoint.TryGetProperty("X", out var x) ? x.GetSingle() : 0,
-                            waypoint.TryGetProperty("Y", out var y) ? y.GetSingle() : 0,
-                            waypoint.TryGetProperty("Z", out var z) ? z.GetSingle() : 0);
                         var objectId = waypoint.TryGetProperty("InteractWithOID", out var oid) ? oid.GetUInt32() : 0;
                         var zoneId = waypoint.TryGetProperty("ZoneID", out var zone) ? zone.GetUInt32() : 0;
                         if (objectId != 0)
@@ -98,8 +106,8 @@ internal sealed class VislandAdapter
                     }
                 }
 
-                if (items.Count > 0)
-                    routes.Add(new RouteSnapshot(name, group, requiresFlying, Compress(route.GetRawText()), items.Values.OrderBy(x => x.Name).ToList(), routeNodes));
+                if (items.Count > 0 && start != null)
+                    routes.Add(new RouteSnapshot(name, group, requiresFlying, Compress(route.GetRawText()), items.Values.OrderBy(x => x.Name).ToList(), routeNodes, start));
             }
 
             var autoExport = false;
@@ -136,6 +144,58 @@ internal sealed class VislandAdapter
     public bool IsNavmeshReady
     {
         get { try { return navmeshReady.HasFunction && navmeshReady.InvokeFunc(); } catch { return false; } }
+    }
+    public bool TryNavigateToStart(RouteSnapshot route, Vector3 currentPosition, out string error)
+    {
+        try
+        {
+            if (!IsNavmeshReady)
+                throw new InvalidOperationException("vnavmesh is not installed or ready.");
+            var approach = new
+            {
+                Name = $"Stock Manager Approach: {route.Name}",
+                Group = "Stock Manager",
+                Food = 0,
+                TargetGatherItem = 0,
+                Waypoints = new[]
+                {
+                    new
+                    {
+                        X = currentPosition.X,
+                        Y = currentPosition.Y,
+                        Z = currentPosition.Z,
+                        Radius = 3f,
+                        Movement = "Normal",
+                        Pathfind = false
+                    },
+                    new
+                    {
+                        X = route.Start.Position.X,
+                        Y = route.Start.Position.Y,
+                        Z = route.Start.Position.Z,
+                        Radius = route.Start.Radius,
+                        Movement = route.Start.Fly ? "MountFly" : "MountNoFly",
+                        Pathfind = true
+                    }
+                }
+            };
+            startRoute.InvokeAction(Compress(JsonSerializer.Serialize(approach)), true);
+            error = string.Empty;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.GetBaseException().Message;
+            return false;
+        }
+    }
+
+    public void StopNavigation()
+    {
+        try { if (stopRoute.HasAction) stopRoute.InvokeAction(); }
+        catch { }
+        try { if (navmeshStop.HasAction) navmeshStop.InvokeAction(); }
+        catch { }
     }
     public bool IsLifestreamAvailable => lifestreamExecute.HasAction && lifestreamBusy.HasFunction;
     public bool IsLifestreamBusy
@@ -198,29 +258,20 @@ internal sealed class VislandAdapter
             var (count, available) = GetItemState(group.Key);
             return new ItemSnapshot(group.Key, resource.Name, group.Count(), count, available);
         }).OrderBy(x => x.Name).ToList();
-        return new RouteSnapshot(name, "Stock Manager", fly, Compress(JsonSerializer.Serialize(route)), items, nodes.ToList());
+        return new RouteSnapshot(name, "Stock Manager", fly, Compress(JsonSerializer.Serialize(route)), items, nodes.ToList(),
+            new RouteStartSnapshot(nodes[0].Position, 3, fly));
     }
 
-    public bool TryStartExportTrip(out string error)
+    public RouteSnapshot CreateExportTripRoute()
     {
         const string routeJson = "{\"Name\":\"Stock Manager Export Trip\",\"Group\":\"Stock Manager\",\"Food\":0,\"TargetGatherItem\":0,\"Waypoints\":[{\"X\":-267.729,\"Y\":40.000008,\"Z\":223.35608,\"Movement\":\"Normal\",\"Pathfind\":true},{\"X\":-267.67017,\"Y\":41.0,\"Z\":220.24205,\"Movement\":\"Normal\",\"Pathfind\":true},{\"X\":-267.57275,\"Y\":41.0,\"Z\":219.37453,\"Movement\":\"Normal\",\"Pathfind\":true},{\"X\":-266.5052,\"Y\":41.499996,\"Z\":217.80667,\"Movement\":\"Normal\",\"Pathfind\":true},{\"X\":-266.4256,\"Y\":41.0,\"Z\":209.15497,\"Movement\":\"Normal\",\"Pathfind\":true,\"InteractWithOID\":1043464,\"Interaction\":\"Standard\"}]}";
-        try
-        {
-            startRoute.InvokeAction(Compress(routeJson), true);
-            error = string.Empty;
-            return true;
-        }
-        catch (Exception ex)
-        {
-            error = ex.GetBaseException().Message;
-            return false;
-        }
+        return new RouteSnapshot("Stock Manager Export Trip", "Stock Manager", false, Compress(routeJson), [], [],
+            new RouteStartSnapshot(new Vector3(-267.729f, 40.000008f, 223.35608f), 3, false));
     }
 
     public void Stop()
     {
-        try { stopRoute.InvokeAction(); }
-        catch { }
+        StopNavigation();
     }
 
     public bool TryDisableBuiltInAutoExport(out string error)
