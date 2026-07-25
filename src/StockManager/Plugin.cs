@@ -17,7 +17,7 @@ using System.Runtime.InteropServices;
 
 namespace StockManager;
 
-public sealed class Plugin : IDalamudPlugin
+public sealed partial class Plugin : IDalamudPlugin
 {
     private const string Command = "/stockmanager";
     private const string ShortCommand = "/sm";
@@ -219,6 +219,7 @@ public sealed class Plugin : IDalamudPlugin
             {
                 status = $"Running experimental test: {activeRoute}";
                 HandleActiveRouteWater(snapshot);
+                if (HandleActiveRouteStuck(snapshot)) return;
             }
             else
             {
@@ -265,6 +266,22 @@ public sealed class Plugin : IDalamudPlugin
         }
         if (snapshot.IsRunning)
         {
+            if (config.CompletionAction == CompletionAction.FarmAndExport)
+            {
+                var exportDue = ManagedItems(snapshot).Where(IsExportDue)
+                    .OrderByDescending(x => x.CurrentCount - ExportTrigger(x.Id)).FirstOrDefault();
+                if (exportDue != null)
+                {
+                    var interruptedRoute = activeRoute;
+                    adapter.Stop();
+                    activeRoute = null;
+                    ClearActiveTargetTracking();
+                    QueueRouteStart(adapter.CreateExportTripRoute(), exportDue, PendingRoutePurpose.Export);
+                    nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
+                    status = $"{exportDue.Name} reached {ExportTrigger(exportDue.Id)} during {interruptedRoute}; stopping the loop to export all configured surplus.";
+                    return;
+                }
+            }
             if (HandleActiveFarmTarget(snapshot)) return;
             var trackedItem = activeTargetItemId == null
                 ? null
@@ -690,6 +707,9 @@ public sealed class Plugin : IDalamudPlugin
             case PendingRoutePurpose.Experimental:
                 ClearActiveTargetTracking();
                 experimentalTestRunning = true;
+                activeLastPosition = services.Objects.LocalPlayer?.Position;
+                activeLastInventoryTotal = snapshot == null ? 0 : UniqueItems(snapshot).Sum(x => x.CurrentCount);
+                activeLastProgressAt = DateTime.UtcNow;
                 status = "Experimental test loop started in Visland. Use Stop test loop or Emergency stop if needed.";
                 experimentalStatus = status;
                 break;
@@ -728,11 +748,11 @@ public sealed class Plugin : IDalamudPlugin
         return true;
     }
 
-    private void HandleActiveRouteStuck(VislandSnapshot data)
+    private bool HandleActiveRouteStuck(VislandSnapshot data)
     {
-        if (!config.SkipStuckRoutes || activeRoute == null || exportTrip || activeDiveStartedAt != null) return;
+        if (!config.SkipStuckRoutes || activeRoute == null || exportTrip || activeDiveStartedAt != null) return false;
         var player = services.Objects.LocalPlayer;
-        if (player == null) return;
+        if (player == null) return false;
         var inventoryTotal = UniqueItems(data).Sum(x => x.CurrentCount);
         if (activeLastPosition == null
             || Vector3.Distance(activeLastPosition.Value, player.Position) >= 1.5f
@@ -741,18 +761,28 @@ public sealed class Plugin : IDalamudPlugin
             activeLastPosition = player.Position;
             activeLastInventoryTotal = inventoryTotal;
             activeLastProgressAt = DateTime.UtcNow;
-            return;
+            return false;
         }
 
-        if (DateTime.UtcNow - activeLastProgressAt <= TimeSpan.FromSeconds(Math.Clamp(config.StuckTimeoutSeconds, 8, 60))) return;
+        if (DateTime.UtcNow - activeLastProgressAt <= TimeSpan.FromSeconds(Math.Clamp(config.StuckTimeoutSeconds, 8, 60))) return false;
 
         var routeName = activeRoute;
         adapter.Stop();
-        blockedRoutes[routeName] = DateTime.UtcNow.AddMinutes(5);
         activeRoute = null;
         ClearActiveTargetTracking();
-        nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
-        status = $"Skipped {routeName}: no movement or gathering progress was detected. Cooling it down for 5 minutes.";
+        if (experimentalTestRunning)
+        {
+            experimentalTestRunning = false;
+            status = $"Stopped experimental test {routeName}: no movement or gathering progress was detected.";
+            experimentalStatus = status;
+        }
+        else
+        {
+            blockedRoutes[routeName] = DateTime.UtcNow.AddMinutes(5);
+            nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
+            status = $"Skipped {routeName}: no movement or gathering progress was detected. Cooling it down for 5 minutes.";
+        }
+        return true;
     }
 
     private void ClearActiveTargetTracking()
@@ -999,6 +1029,12 @@ public sealed class Plugin : IDalamudPlugin
             config.Version = 7;
             changed = true;
         }
+        if (config.Version < 8)
+        {
+            config.UserRoutes ??= [];
+            config.Version = 8;
+            changed = true;
+        }
         if (changed) Save();
     }
 
@@ -1021,6 +1057,7 @@ public sealed class Plugin : IDalamudPlugin
         var routes = SelectableRoutes(data);
         var candidates = ManagedItems(data).Where(x => x.IsAvailable)
             .Where(x => config.Targets[x.Id] > x.CurrentCount).ToList();
+        routes = PreferRespawnDetour(routes, candidates);
         if (config.ResourcePriority == ResourcePriority.FastestRoute)
             return SelectBestProgressRoute(routes, candidates, x => config.Targets[x.Id]);
         var items = OrderItems(data, candidates, x => config.Targets[x.Id], routes);
@@ -1041,16 +1078,11 @@ public sealed class Plugin : IDalamudPlugin
         var items = ManagedItems(data).Where(x => x.IsAvailable)
             .Where(x => config.Targets.TryGetValue(x.Id, out var target) && target is > 0 and < 999)
             .Where(x => x.CurrentCount < ExportTrigger(x.Id)).ToList();
-        if (config.ResourcePriority == ResourcePriority.FastestRoute)
-            return SelectBestProgressRoute(routes, items, x => ExportTrigger(x.Id));
-        foreach (var item in OrderItems(data, items, x => ExportTrigger(x.Id), routes))
-        {
-            var route = routes.Select(x => (Route: x, Item: x.Items.FirstOrDefault(y => y.Id == item.Id)))
-                .Where(x => x.Item is { PerLoop: > 0 }).OrderByDescending(x => x.Item!.PerLoop)
-                .ThenByDescending(x => RouteUtility(x.Route)).FirstOrDefault();
-            if (route.Item != null) return (route.Route, item);
-        }
-        return null;
+        routes = PreferRespawnDetour(routes, items);
+        // Once every enabled resource has reached its retained stock, the user-selected balancing priority no
+        // longer applies. Choose the best overall surplus route so cowrie farming favors useful yield and short
+        // travel instead of repeatedly filling the same low-stock material.
+        return SelectBestProgressRoute(routes, items, x => ExportTrigger(x.Id));
     }
 
     private (RouteSnapshot Route, ItemSnapshot Item)? SelectBestProgressRoute(
@@ -1074,8 +1106,10 @@ public sealed class Plugin : IDalamudPlugin
             var usefulNodes = useful.Sum(x => x.UsefulNodes);
             var coveredTypes = useful.Count;
             var weightedNeed = useful.Sum(x => x.UsefulNodes * (double)x.Remaining / Math.Max(1, goal(x.Item)));
-            var totalGatherNodes = route.Items.Sum(x => x.PerLoop);
-            var wastedNodes = Math.Max(0, totalGatherNodes - usefulNodes);
+            var physicalNodes = route.Nodes.GroupBy(NodeKey).Select(x => x.First()).ToList();
+            var usefulPhysicalNodes = physicalNodes.Count(node => node.ItemIds.Any(id => byId.TryGetValue(id, out var item)
+                && item.CurrentCount < goal(item)));
+            var wastedNodes = Math.Max(0, physicalNodes.Count - usefulPhysicalNodes);
             var cycleDistance = RouteCycleDistance(route);
             var approachDistance = player == null || route.Waypoints.Count == 0
                 ? 0
@@ -1098,6 +1132,24 @@ public sealed class Plugin : IDalamudPlugin
         var currentArea = ranked.FirstOrDefault(x => string.Equals(x.Route.Name, lastFarmRoute, StringComparison.OrdinalIgnoreCase));
         if (currentArea.Item != null && currentArea.Score >= best.Score * .8) best = currentArea;
         return (best.Route, best.Item!);
+    }
+
+    private List<RouteSnapshot> PreferRespawnDetour(List<RouteSnapshot> routes, IReadOnlyCollection<ItemSnapshot> candidates)
+    {
+        if (lastFarmRoute == null || candidates.Count == 0) return routes;
+        var previous = routes.FirstOrDefault(x => string.Equals(x.Name, lastFarmRoute, StringComparison.OrdinalIgnoreCase));
+        if (previous == null) return routes;
+        var previousNodes = previous.Nodes.GroupBy(NodeKey).Select(x => x.Key).ToHashSet();
+        // Eleven physical nodes is the mathematical minimum, but a single failed interaction makes an immediate
+        // repeat too short. Routes with only eleven nodes therefore take a useful detour when one is available.
+        if (previousNodes.Count >= 12) return routes;
+
+        var candidateIds = candidates.Select(x => x.Id).ToHashSet();
+        var detours = routes.Where(x => !string.Equals(x.Name, previous.Name, StringComparison.OrdinalIgnoreCase))
+            .Where(x => x.Items.Any(item => candidateIds.Contains(item.Id)))
+            .Where(x => previousNodes.Concat(x.Nodes.Select(NodeKey)).Distinct().Count() >= 12)
+            .ToList();
+        return detours.Count > 0 ? detours : routes;
     }
 
     private static double RouteCycleDistance(RouteSnapshot route)
@@ -1160,6 +1212,7 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     private IEnumerable<RouteSnapshot> CompatibleRoutes(VislandSnapshot data) => data.Routes
+        .Concat(GetUserRouteSnapshots(data, true))
         .Where(x => data.FlightUnlocked == true || !x.RequiresFlying);
 
     private List<RouteSnapshot> SelectableRoutes(VislandSnapshot data)
@@ -1211,6 +1264,11 @@ public sealed class Plugin : IDalamudPlugin
                 DrawAutomation();
                 ImGui.EndTabItem();
             }
+            if (ImGui.BeginTabItem("Routes"))
+            {
+                DrawRouteWorkbench();
+                ImGui.EndTabItem();
+            }
             if (ImGui.BeginTabItem("Map"))
             {
                 DrawMap();
@@ -1236,7 +1294,7 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        var routes = snapshot.Routes.ToList();
+        var routes = snapshot.Routes.Concat(GetUserRouteSnapshots(snapshot, false)).ToList();
         if (experimentalRoute != null)
         {
             routes.RemoveAll(x => string.Equals(x.Name, experimentalRoute.Name, StringComparison.OrdinalIgnoreCase));
@@ -1304,7 +1362,7 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
-        var allNodes = routes.SelectMany(x => x.Nodes).GroupBy(NodeKey).Select(x => x.First()).ToList();
+        var allNodes = GetKnownNodes(snapshot);
         var visibleNodes = mapDisplayMode switch
         {
             MapDisplayMode.AllNodes => allNodes,
@@ -1738,8 +1796,6 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
-        ImGui.Spacing(); ImGui.Separator();
-        DrawExperimentalRouteGenerator(data);
     }
 
     private void DrawExperimentalRouteGenerator(VislandSnapshot data)
@@ -1748,8 +1804,8 @@ public sealed class Plugin : IDalamudPlugin
         ImGui.TextWrapped("Builds a compact temporary route from gathering nodes already present in imported Visland routes. Nearby target nodes are added before distant detours.");
         ImGui.TextColored(new Vector4(1f, .75f, .25f, 1), "Experimental: inspect and test the result before relying on it.");
         var limit = experimentalNodeLimit; ImGui.SetNextItemWidth(75);
-        if (ImGui.InputInt("Maximum nodes", ref limit)) experimentalNodeLimit = Math.Clamp(limit, 11, 30);
-        ImGui.TextDisabled("At least 11 unique nodes are used for respawns; short hops between nearby nodes stay on foot.");
+        if (ImGui.InputInt("Maximum nodes", ref limit)) experimentalNodeLimit = Math.Clamp(limit, 12, 30);
+        ImGui.TextDisabled("At least 12 unique nodes provide a one-node respawn safety margin; short nearby hops stay on foot.");
 
         var canGenerate = data.FlightUnlocked != null && !config.Enabled && !data.IsRunning
                           && pendingRouteStart == null && !experimentalTestRunning;
@@ -1757,7 +1813,8 @@ public sealed class Plugin : IDalamudPlugin
         if (ImGui.Button("Generate preview")) GenerateExperimentalRoute(data);
         if (!canGenerate) ImGui.EndDisabled();
         ImGui.SameLine();
-        var canRun = canGenerate && experimentalRoute != null && adapter.IsNavmeshReady && data.FlightUnlocked == true;
+        var canRun = canGenerate && experimentalRoute != null && adapter.IsNavmeshReady
+                     && (data.FlightUnlocked == true || !experimentalRoute.RequiresFlying);
         if (!canRun) ImGui.BeginDisabled();
         if (ImGui.Button("Run one test loop") && experimentalRoute != null)
         {
@@ -1771,9 +1828,17 @@ public sealed class Plugin : IDalamudPlugin
         if (!testActive) ImGui.EndDisabled();
         ImGui.TextWrapped(experimentalStatus);
         if (!adapter.IsNavmeshReady) ImGui.TextDisabled("vnavmesh must be installed and ready to test a generated route.");
-        else if (data.FlightUnlocked != true)
+        else
             ImGui.TextColored(new Vector4(1f, .65f, .25f, 1),
-                "Ground test loops are disabled: generated node-to-node legs are not yet navmesh-validated and may cross terrain. The map preview remains available.");
+                "Generated legs are experimental: vnavmesh may select inaccessible or progression-gated geometry. Supervise tests and use Stop test loop if movement looks wrong.");
+        if (experimentalRoute != null && ImGui.Button("Save preview as editable route"))
+        {
+            var saved = CreateUserRoute(experimentalRoute, "Generated route");
+            config.UserRoutes.Add(saved);
+            routeWorkbenchUserRouteId = saved.Id;
+            Save();
+            experimentalStatus = $"Saved {saved.Name} in the Routes editor.";
+        }
     }
 
     private void GenerateExperimentalRoute(VislandSnapshot data)
@@ -1791,7 +1856,7 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         var availableIds = UniqueItems(data).Where(x => x.IsAvailable).Select(x => x.Id).ToHashSet();
-        var allNodes = compatible.SelectMany(x => x.Nodes)
+        var allNodes = GetKnownNodes(data)
             .Where(x => data.FlightUnlocked == true || !RouteAccessibility.IsFlightOnlyAltitude(x.Position))
             .Where(x => x.ItemIds.Any(availableIds.Contains))
             .GroupBy(NodeKey).Select(x => x.First()).ToList();
@@ -1809,16 +1874,16 @@ public sealed class Plugin : IDalamudPlugin
             experimentalStatus = $"The selected resources cannot all fit within {experimentalNodeLimit} nodes. Increase Maximum nodes or enable fewer resources.";
             return;
         }
-        while (selected.Count < 11)
+        while (selected.Count < 12)
         {
             var support = allNodes.Where(x => !selected.Contains(x))
                 .OrderBy(x => InsertionCost(selected, x)).FirstOrDefault();
             if (support == null) break;
             selected.Add(support);
         }
-        if (selected.Count < 11)
+        if (selected.Count < 12)
         {
-            experimentalStatus = $"Only {selected.Count} unique nodes are available; at least 11 are required for a stable loop.";
+            experimentalStatus = $"Only {selected.Count} unique nodes are available; at least 12 are required for a resilient loop.";
             return;
         }
 
