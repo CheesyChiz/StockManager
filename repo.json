@@ -5,7 +5,7 @@
     "Punchline": "Balances Island Sanctuary resources with imported Visland routes.",
     "Description": "Automatically switches between Island gathering routes imported into Visland based on the largest relative resource deficit.",
     "InternalName": "StockManager",
-    "AssemblyVersion": "1.2.0.0",
+    "AssemblyVersion": "1.2.1.0",
     "TestingAssemblyVersion": null,
     "RepoUrl": "https://github.com/CheesyChiz/StockManager",
     "ApplicableVersion": "any",
@@ -17,9 +17,9 @@
     ],
     "IsHide": false,
     "IsTestingExclusive": false,
-    "DownloadLinkInstall": "https://github.com/CheesyChiz/StockManager/releases/download/v1.2.0/StockManager.zip",
-    "DownloadLinkUpdate": "https://github.com/CheesyChiz/StockManager/releases/download/v1.2.0/StockManager.zip",
+    "DownloadLinkInstall": "https://github.com/CheesyChiz/StockManager/releases/download/v1.2.1/StockManager.zip",
+    "DownloadLinkUpdate": "https://github.com/CheesyChiz/StockManager/releases/download/v1.2.1/StockManager.zip",
     "DownloadLinkTesting": null,
-    "LastUpdate": 1784940100
+    "LastUpdate": 1784940950
   }
 ]
