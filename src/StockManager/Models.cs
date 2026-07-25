@@ -15,7 +15,13 @@ public sealed record RouteSnapshot(
     [property: JsonPropertyName("RequiresFlying")] bool RequiresFlying,
     [property: JsonIgnore] string SerializedRoute,
     [property: JsonPropertyName("Items")] List<ItemSnapshot> Items,
-    [property: JsonIgnore] List<RouteNodeSnapshot> Nodes);
+    [property: JsonIgnore] List<RouteNodeSnapshot> Nodes,
+    [property: JsonIgnore] RouteStartSnapshot Start);
+
+public sealed record RouteStartSnapshot(
+    Vector3 Position,
+    float Radius,
+    bool Fly);
 
 public sealed record RouteNodeSnapshot(
     Vector3 Position,

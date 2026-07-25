@@ -16,6 +16,7 @@ Stock Manager keeps selected gathering resources at your chosen levels. It runs 
 - Balances resources by their relative deficit instead of repeatedly farming one fixed route.
 - Enables resources independently without losing their configured stock values.
 - Selects the best compatible imported route automatically for each enabled resource.
+- Uses vnavmesh to reach a route's first waypoint before handing control to Visland.
 - Detects Island flight access and excludes flying routes and their exclusive resources when flight is locked.
 - Detects resources locked by Island progression or missing tools and ignores them automatically.
 - Optionally uses Lifestream to travel to the Island from a button or when automation starts.
@@ -77,13 +78,14 @@ Export batch: 100
 
 In export mode, the resource is initially complete at 800. Stock Manager then continues farming it, visits the exporter at 900, sells it back to 800, and resumes gathering. This gap prevents a new exporter trip after every route loop.
 
-The stock value plus the export batch can never exceed the Island material cap of `999`. Invalid settings are shown in red and automation cannot start until they are corrected. A resource set to `999` can be completed normally but is excluded from continued export farming.
+The stock value plus the export batch can never exceed the Island material cap of `999`. Invalid settings are shown in red and automation cannot start until they are corrected. A stock value of `999` is therefore valid only in **Stop** mode; export mode needs room for at least one gathered item above the sell value.
 
 Stock Manager owns surplus selling in export mode and automatically disables Visland's global **Auto Export** option, so there is only one active set of export rules.
 
 ## Route rules
 
 - Routes are not enabled manually. A checked resource is the single source of truth, and Stock Manager chooses its best available route by yield and current deficits.
+- Before every gathering or export route, Stock Manager runs a short Visland/vnavmesh approach route to the first waypoint and verifies arrival before starting the real route. This avoids direct movement into terrain when a route starts far away and preserves Visland's mount and flight handling.
 - While on the Island, the game flight-access flag is detected automatically.
 - If flight is locked, every route containing a `MountFly` waypoint and resources available only through those routes are ignored.
 - `MountNoFly` waypoints remain ground-compatible.
@@ -101,10 +103,15 @@ Generated previews are not saved to Visland and are not used by normal automatio
 
 | Command | Action |
 | --- | --- |
-| `/stockmanager` | Open the Stock Manager window. |
-| `/sm` | Short alias for `/stockmanager`. |
+| `/stockmanager` or `/sm` | Open the Stock Manager window. |
+| `/sm start` | Start automation and reset the collection statistics for this run. |
+| `/sm stop` | Stop automation and the current route. |
+| `/sm status` | Print the current state, active route, elapsed time, and resources collected this run. |
+| `/sm travel` | Ask Lifestream to travel to the Island. |
+| `/sm emergency` | Stop Stock Manager, Visland, vnavmesh, and active Lifestream travel immediately. |
+| `/sm help` | Print the command list. |
 
-Use **Emergency stop** to disable Stock Manager and stop the current Visland route immediately.
+Session statistics count positive inventory changes while automation is active, so gathered materials remain in the total even after Stock Manager exports the surplus.
 
 ## Building
 
