@@ -10,8 +10,6 @@
 
 Stock Manager keeps selected gathering resources at your chosen levels. It runs one Visland route at a time, checks the Island inventory after every loop, and switches to whichever available resource is furthest below its target.
 
-This is an independent plugin. It does not contain or require ExplorersIcebox files.
-
 ## Features
 
 - Uses routes already imported into Visland's `Island` group.
