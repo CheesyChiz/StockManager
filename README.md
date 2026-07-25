@@ -16,7 +16,8 @@ Stock Manager keeps selected gathering resources at your chosen levels. It runs 
 - Balances resources by their relative deficit instead of repeatedly farming one fixed route.
 - Enables resources independently without losing their configured stock values.
 - Selects the best compatible imported route automatically for each enabled resource.
-- Uses vnavmesh to reach a route's first waypoint before handing control to Visland.
+- Uses vnavmesh to travel from the character's current position before handing control to Visland.
+- Can use mount roulette or a specific unlocked mount for longer trips to a route.
 - Detects Island flight access and excludes flying routes and their exclusive resources when flight is locked.
 - Detects resources locked by Island progression or missing tools and ignores them automatically.
 - Optionally uses Lifestream to travel to the Island from a button or when automation starts.
@@ -46,7 +47,7 @@ Test every imported route manually in Visland before enabling unattended switchi
    ```
 
 4. Open `/xlplugins` and install **Stock Manager**.
-5. Open the plugin with `/stockmanager` or the shorter `/sm` alias.
+5. Open the plugin with `/stockmanager` or the shorter `/sm` alias. Use its **Settings** tab to choose mount roulette or search for a specific unlocked mount.
 
 Installing through the custom repository provides normal Dalamud update notifications. Manual ZIP installation is not recommended.
 
@@ -85,7 +86,9 @@ Stock Manager owns surplus selling in export mode and automatically disables Vis
 ## Route rules
 
 - Routes are not enabled manually. A checked resource is the single source of truth, and Stock Manager chooses its best available route by yield and current deficits.
-- Before every gathering or export route, Stock Manager runs a short Visland/vnavmesh approach route to the first waypoint and verifies arrival before starting the real route. This avoids direct movement into terrain when a route starts far away and preserves Visland's mount and flight handling.
+- Stock Manager asks vnavmesh to path from the character's current position to the selected route. It does not return to the Island base first.
+- For a longer transfer, Stock Manager mounts before starting vnavmesh. Choose mount roulette or any unlocked mount from the searchable **Settings** tab; Visland remains responsible for movement inside the gathering route.
+- When the character is already within 35 yalms of a route, the closest waypoint becomes the start of that loop. Otherwise Stock Manager approaches the route's original first waypoint.
 - While on the Island, the game flight-access flag is detected automatically.
 - If flight is locked, every route containing a `MountFly` waypoint and resources available only through those routes are ignored.
 - `MountNoFly` waypoints remain ground-compatible.

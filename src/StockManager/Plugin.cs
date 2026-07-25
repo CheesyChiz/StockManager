@@ -1,11 +1,14 @@
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.Command;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Component.GUI;
+using MountSheet = Lumina.Excel.Sheets.Mount;
 using System.Numerics;
 using System.Runtime.InteropServices;
 
@@ -26,6 +29,7 @@ public sealed class Plugin : IDalamudPlugin
     private DateTime closeExportAfter = DateTime.MaxValue;
     private DateTime nextTravelAttempt = DateTime.MinValue;
     private bool windowOpen;
+    private bool settingsRequested;
     private bool exportTrip;
     private bool exportSubmitted;
     private bool travelRequested;
@@ -34,6 +38,8 @@ public sealed class Plugin : IDalamudPlugin
     private string? activeRoute;
     private PendingRouteStart? pendingRouteStart;
     private DateTime navigationStartedAt;
+    private DateTime navigationRequestedAt;
+    private DateTime nextMountAttempt;
     private RouteSnapshot? experimentalRoute;
     private string experimentalStatus = "Uses enabled resources and nodes found in imported Visland routes.";
     private int experimentalNodeLimit = 18;
@@ -42,6 +48,9 @@ public sealed class Plugin : IDalamudPlugin
     private DateTime? sessionStartedAt;
     private DateTime? sessionEndedAt;
     private bool sessionTracking;
+    private readonly List<MountOption> availableMounts = new();
+    private string mountSearch = string.Empty;
+    private DateTime nextMountRefresh = DateTime.MinValue;
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
@@ -55,7 +64,7 @@ public sealed class Plugin : IDalamudPlugin
         services.Framework.Update += OnUpdate;
         pluginInterface.UiBuilder.Draw += Draw;
         pluginInterface.UiBuilder.OpenMainUi += OpenMainUi;
-        pluginInterface.UiBuilder.OpenConfigUi += OpenMainUi;
+        pluginInterface.UiBuilder.OpenConfigUi += OpenSettingsUi;
     }
 
     public string Name => "Stock Manager";
@@ -68,10 +77,20 @@ public sealed class Plugin : IDalamudPlugin
         services.Commands.RemoveHandler(ShortCommand);
         pluginInterface.UiBuilder.Draw -= Draw;
         pluginInterface.UiBuilder.OpenMainUi -= OpenMainUi;
-        pluginInterface.UiBuilder.OpenConfigUi -= OpenMainUi;
+        pluginInterface.UiBuilder.OpenConfigUi -= OpenSettingsUi;
     }
 
-    private void OpenMainUi() => windowOpen = true;
+    private void OpenMainUi()
+    {
+        settingsRequested = false;
+        windowOpen = true;
+    }
+
+    private void OpenSettingsUi()
+    {
+        settingsRequested = true;
+        windowOpen = true;
+    }
 
     private void HandleCommand(string _, string arguments)
     {
@@ -283,23 +302,31 @@ public sealed class Plugin : IDalamudPlugin
     private bool QueueRouteStart(RouteSnapshot route, string? itemName, PendingRoutePurpose purpose)
     {
         var player = services.Objects.LocalPlayer;
-        if (player == null)
+        if (player == null || route.Waypoints.Count == 0)
         {
-            status = "The local player is unavailable.";
+            status = player == null ? "The local player is unavailable." : $"Route {route.Name} has no waypoints.";
             if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
             return false;
         }
-        if (!adapter.TryNavigateToStart(route, player.Position, out var error))
+        if (!adapter.IsNavmeshReady)
         {
-            status = $"Could not navigate to the start of {route.Name}: {error}";
+            status = "vnavmesh is not installed or ready.";
             if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
             return false;
         }
 
-        pendingRouteStart = new PendingRouteStart(route, itemName, purpose);
+        var nearest = route.Waypoints.Select((waypoint, index) => (Waypoint: waypoint, Index: index,
+                Distance: Vector3.Distance(player.Position, waypoint.Position)))
+            .OrderBy(x => x.Distance).First();
+        var startIndex = nearest.Distance <= 35f ? nearest.Index : 0;
+        pendingRouteStart = new PendingRouteStart(route, itemName, purpose, startIndex);
         navigationStartedAt = DateTime.UtcNow;
+        navigationRequestedAt = DateTime.MinValue;
+        nextMountAttempt = DateTime.MinValue;
         activeRoute = route.Name;
-        status = $"Navigating with vnavmesh to the start of {route.Name}...";
+        status = nearest.Distance <= 35f
+            ? $"Starting {route.Name} from nearby waypoint #{startIndex + 1}..."
+            : $"Preparing a direct vnavmesh route to {route.Name}...";
         if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
         return true;
     }
@@ -319,24 +346,81 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        status = $"Navigating with vnavmesh to the start of {pending.Route.Name}...";
-        if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
-        if (DateTime.UtcNow - navigationStartedAt < TimeSpan.FromSeconds(1) || data.IsRunning) return;
-
         var player = services.Objects.LocalPlayer;
-        var arrivalRadius = Math.Max(5f, pending.Route.Start.Radius + 2f);
-        if (player == null || Vector3.Distance(player.Position, pending.Route.Start.Position) > arrivalRadius)
+        if (player == null)
         {
             pendingRouteStart = null;
             activeRoute = null;
-            status = $"vnavmesh stopped before reaching the start of {pending.Route.Name}.";
+            status = "The local player is unavailable.";
             if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
             nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
             return;
         }
 
+        if (data.IsRunning)
+        {
+            status = "Waiting for the current Visland route to finish before navigating...";
+            return;
+        }
+
+        var waypoint = pending.Route.Waypoints[pending.StartIndex];
+        var distance = Vector3.Distance(player.Position, waypoint.Position);
+        var arrivalRadius = Math.Max(5f, waypoint.Radius + 2f);
+        if (distance <= arrivalRadius)
+        {
+            StartPreparedRoute(pending);
+            return;
+        }
+
+        var requiresMount = distance > 12f || waypoint.Movement != RouteMovement.Normal;
+        if (requiresMount && !services.Condition[ConditionFlag.Mounted])
+        {
+            pending.NavigationRequested = false;
+            adapter.StopNavigation();
+            status = $"Mounting before travelling directly to {pending.Route.Name}...";
+            if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            if (!services.Condition[ConditionFlag.Casting]
+                && !services.Condition[ConditionFlag.Mounting]
+                && !services.Condition[ConditionFlag.MountOrOrnamentTransition]
+                && DateTime.UtcNow >= nextMountAttempt)
+            {
+                TryUseConfiguredMount();
+                nextMountAttempt = DateTime.UtcNow.AddSeconds(1);
+            }
+            return;
+        }
+
+        if (!pending.NavigationRequested)
+        {
+            if (!adapter.TryNavigateTo(waypoint.Position, waypoint.Movement == RouteMovement.MountFly, out var error))
+            {
+                pendingRouteStart = null;
+                activeRoute = null;
+                status = $"Could not navigate to {pending.Route.Name}: {error}";
+                if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+                nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
+                return;
+            }
+            pending.NavigationRequested = true;
+            navigationRequestedAt = DateTime.UtcNow;
+        }
+
+        status = $"Navigating directly with vnavmesh to {pending.Route.Name}... ({distance:F0} yalms)";
+        if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+        if (DateTime.UtcNow - navigationRequestedAt < TimeSpan.FromSeconds(2) || adapter.IsNavigationBusy) return;
+
         pendingRouteStart = null;
-        if (!adapter.TryStartRoute(pending.Route, out var error))
+        activeRoute = null;
+        status = $"vnavmesh stopped before reaching {pending.Route.Name}.";
+        if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+        nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
+    }
+
+    private void StartPreparedRoute(PendingRouteStart pending)
+    {
+        adapter.StopNavigation();
+        pendingRouteStart = null;
+        if (!adapter.TryStartRoute(pending.Route, pending.StartIndex, out var error))
         {
             activeRoute = null;
             status = $"Visland rejected start: {error}";
@@ -363,6 +447,39 @@ public sealed class Plugin : IDalamudPlugin
                 status = $"Starting {pending.Route.Name} for {pending.ItemName}.";
                 break;
         }
+    }
+
+    private unsafe void TryUseConfiguredMount()
+    {
+        var actions = ActionManager.Instance();
+        if (actions == null) return;
+        var playerState = PlayerState.Instance();
+        if (config.MountId != 0 && playerState != null && playerState->IsMountUnlocked(config.MountId))
+        {
+            if (actions->UseAction(ActionType.Mount, config.MountId)) return;
+        }
+        actions->UseAction(ActionType.GeneralAction, 24);
+    }
+
+    private unsafe void RefreshAvailableMounts()
+    {
+        if (DateTime.UtcNow < nextMountRefresh) return;
+        nextMountRefresh = DateTime.UtcNow.AddSeconds(5);
+        availableMounts.Clear();
+
+        if (!services.ClientState.IsLoggedIn) return;
+        var playerState = PlayerState.Instance();
+        if (playerState == null) return;
+
+        foreach (var mount in services.Data.GetExcelSheet<MountSheet>())
+        {
+            if (mount.RowId == 0 || !playerState->IsMountUnlocked(mount.RowId)) continue;
+            var name = mount.Singular.ToString().Trim();
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            availableMounts.Add(new MountOption(mount.RowId, name));
+        }
+
+        availableMounts.Sort((left, right) => StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name));
     }
 
     private void BeginSession(VislandSnapshot data)
@@ -520,8 +637,34 @@ public sealed class Plugin : IDalamudPlugin
         ImGui.SetNextWindowSize(new Vector2(1100, 680), ImGuiCond.FirstUseEver);
         if (!ImGui.Begin("Stock Manager###StockManager", ref windowOpen)) { ImGui.End(); return; }
 
+        if (ImGui.BeginTabBar("StockManagerTabs"))
+        {
+            if (ImGui.BeginTabItem("Automation"))
+            {
+                DrawAutomation();
+                ImGui.EndTabItem();
+            }
+            var settingsFlags = settingsRequested ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
+            if (ImGui.BeginTabItem("Settings", settingsFlags))
+            {
+                settingsRequested = false;
+                DrawSettings();
+                ImGui.EndTabItem();
+            }
+            ImGui.EndTabBar();
+        }
+        ImGui.End();
+    }
+
+    private void DrawAutomation()
+    {
         ImGui.TextColored(config.Enabled ? new Vector4(.35f, .9f, .45f, 1) : new Vector4(.7f, .7f, .7f, 1), config.Enabled ? "ACTIVE" : "STOPPED");
         ImGui.SameLine(); ImGui.TextWrapped(status);
+        if (sessionStartedAt != null)
+        {
+            var duration = (sessionEndedAt ?? DateTime.UtcNow) - sessionStartedAt.Value;
+            ImGui.TextDisabled($"This run: {duration:h\\:mm\\:ss}  |  {sessionCollected.Values.Sum()} gathered");
+        }
         if (ImGui.Button(config.Enabled ? "Stop automation" : "Start automation"))
         {
             if (config.Enabled) StopAutomation(false, "Stopped");
@@ -552,7 +695,54 @@ public sealed class Plugin : IDalamudPlugin
             if (ImGui.BeginChild("RoutesPanel", new Vector2(0, -1), true)) DrawRoutes(snapshot);
             ImGui.EndChild(); ImGui.EndTable();
         }
-        ImGui.End();
+    }
+
+    private unsafe void DrawSettings()
+    {
+        RefreshAvailableMounts();
+        ImGui.TextUnformatted("Navigation");
+        ImGui.Separator();
+        ImGui.TextWrapped("Stock Manager travels directly from the character's current position. It does not return to the Island base before starting a route.");
+        ImGui.TextDisabled("If you are already near the selected route, the closest waypoint is used as its starting point.");
+        ImGui.Spacing();
+
+        ImGui.TextUnformatted("Travel mount");
+        var roulette = config.MountId == 0;
+        if (ImGui.RadioButton("Mount roulette", roulette))
+        {
+            config.MountId = 0;
+            Save();
+        }
+        var specific = config.MountId != 0;
+        if (ImGui.RadioButton("Choose an unlocked mount", specific) && availableMounts.Count > 0)
+        {
+            config.MountId = availableMounts[0].Id;
+            Save();
+        }
+        ImGui.TextDisabled("The selected mount is used only for the direct trip to a route. Visland controls movement inside the route.");
+        ImGui.TextDisabled($"{availableMounts.Count} unlocked mounts found on this character.");
+
+        if (config.MountId == 0) return;
+        var selected = availableMounts.FirstOrDefault(x => x.Id == config.MountId);
+        if (selected == null)
+            ImGui.TextColored(new Vector4(1f, .45f, .3f, 1), "The selected mount is not unlocked on this character; mount roulette will be used as a fallback.");
+        else ImGui.TextColored(new Vector4(.35f, .9f, .45f, 1), $"Selected: {selected.Name}");
+
+        ImGui.SetNextItemWidth(-1);
+        ImGui.InputTextWithHint("##MountSearch", "Search unlocked mounts...", ref mountSearch, 100);
+        if (ImGui.BeginChild("MountList", new Vector2(0, 320), true))
+        {
+            foreach (var mount in availableMounts.Where(x => string.IsNullOrWhiteSpace(mountSearch)
+                         || x.Name.Contains(mountSearch, StringComparison.OrdinalIgnoreCase)))
+            {
+                if (ImGui.Selectable($"{mount.Name}##mount{mount.Id}", mount.Id == config.MountId))
+                {
+                    config.MountId = mount.Id;
+                    Save();
+                }
+            }
+        }
+        ImGui.EndChild();
     }
 
     private void DrawTargets(VislandSnapshot data)
@@ -879,13 +1069,24 @@ public sealed class Plugin : IDalamudPlugin
         Experimental,
     }
 
-    private sealed record PendingRouteStart(RouteSnapshot Route, string? ItemName, PendingRoutePurpose Purpose);
+    private sealed class PendingRouteStart(RouteSnapshot route, string? itemName, PendingRoutePurpose purpose, int startIndex)
+    {
+        public RouteSnapshot Route { get; } = route;
+        public string? ItemName { get; } = itemName;
+        public PendingRoutePurpose Purpose { get; } = purpose;
+        public int StartIndex { get; } = startIndex;
+        public bool NavigationRequested { get; set; }
+    }
+
+    private sealed record MountOption(uint Id, string Name);
 
     private sealed class Services
     {
         [PluginService] internal ICommandManager Commands { get; private init; } = null!;
         [PluginService] internal IFramework Framework { get; private init; } = null!;
         [PluginService] internal IClientState ClientState { get; private init; } = null!;
+        [PluginService] internal ICondition Condition { get; private init; } = null!;
+        [PluginService] internal IDataManager Data { get; private init; } = null!;
         [PluginService] internal IObjectTable Objects { get; private init; } = null!;
         [PluginService] internal IGameGui GameGui { get; private init; } = null!;
         [PluginService] internal IChatGui ChatGui { get; private init; } = null!;
