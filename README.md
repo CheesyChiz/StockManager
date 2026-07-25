@@ -41,7 +41,7 @@ Test every imported route manually in Visland before enabling unattended switchi
    ```
 
 4. Open `/xlplugins` and install **Stock Manager**.
-5. Open the plugin with `/stockmanager`.
+5. Open the plugin with `/stockmanager` or the shorter `/sm` alias.
 
 Installing through the custom repository provides normal Dalamud update notifications. Manual ZIP installation is not recommended.
 
@@ -92,6 +92,7 @@ Stock Manager currently recognizes the English interaction names used by the com
 | Command | Action |
 | --- | --- |
 | `/stockmanager` | Open the Stock Manager window. |
+| `/sm` | Short alias for `/stockmanager`. |
 
 Use **Emergency stop** to disable Stock Manager and stop the current Visland route immediately.
 
