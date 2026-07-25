@@ -5,10 +5,13 @@ namespace StockManager;
 
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 6;
+    public int Version { get; set; } = 7;
     public bool Enabled { get; set; }
     public bool AutoTravelToIsland { get; set; }
     public uint MountId { get; set; }
+    public ResourcePriority ResourcePriority { get; set; } = ResourcePriority.RelativeDeficit;
+    public bool SkipStuckRoutes { get; set; } = true;
+    public int StuckTimeoutSeconds { get; set; } = 15;
     public int BulkTarget { get; set; } = 999;
     public CompletionAction CompletionAction { get; set; } = CompletionAction.Stop;
     public int ExportBatch { get; set; } = 100;
@@ -28,4 +31,12 @@ public enum CompletionAction
 {
     Stop,
     FarmAndExport,
+}
+
+public enum ResourcePriority
+{
+    RelativeDeficit,
+    LowestStock,
+    HighestStock,
+    FastestRoute,
 }
