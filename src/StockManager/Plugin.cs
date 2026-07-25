@@ -14,6 +14,7 @@ namespace StockManager;
 public sealed class Plugin : IDalamudPlugin
 {
     private const string Command = "/stockmanager";
+    private const string ShortCommand = "/sm";
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly Services services;
     private readonly Configuration config;
@@ -37,6 +38,7 @@ public sealed class Plugin : IDalamudPlugin
         config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         MigrateConfiguration();
         services.Commands.AddHandler(Command, new CommandInfo((_, _) => windowOpen = true) { HelpMessage = "Open Stock Manager" });
+        services.Commands.AddHandler(ShortCommand, new CommandInfo((_, _) => windowOpen = true) { HelpMessage = "Open Stock Manager" });
         services.Framework.Update += OnUpdate;
         pluginInterface.UiBuilder.Draw += Draw;
         pluginInterface.UiBuilder.OpenMainUi += OpenMainUi;
@@ -50,6 +52,7 @@ public sealed class Plugin : IDalamudPlugin
         config.Enabled = false;
         services.Framework.Update -= OnUpdate;
         services.Commands.RemoveHandler(Command);
+        services.Commands.RemoveHandler(ShortCommand);
         pluginInterface.UiBuilder.Draw -= Draw;
         pluginInterface.UiBuilder.OpenMainUi -= OpenMainUi;
         pluginInterface.UiBuilder.OpenConfigUi -= OpenMainUi;
