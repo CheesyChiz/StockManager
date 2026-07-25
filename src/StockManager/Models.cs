@@ -13,15 +13,35 @@ public sealed record RouteSnapshot(
     [property: JsonPropertyName("Name")] string Name,
     [property: JsonPropertyName("Group")] string Group,
     [property: JsonPropertyName("RequiresFlying")] bool RequiresFlying,
-    [property: JsonIgnore] string SerializedRoute,
+    [property: JsonIgnore] int Food,
+    [property: JsonIgnore] int TargetGatherItem,
     [property: JsonPropertyName("Items")] List<ItemSnapshot> Items,
     [property: JsonIgnore] List<RouteNodeSnapshot> Nodes,
-    [property: JsonIgnore] RouteStartSnapshot Start);
+    [property: JsonIgnore] List<RouteWaypointSnapshot> Waypoints);
 
-public sealed record RouteStartSnapshot(
+public sealed record RouteWaypointSnapshot(
     Vector3 Position,
+    uint ZoneId,
     float Radius,
-    bool Fly);
+    RouteMovement Movement,
+    bool Pathfind,
+    uint ObjectId,
+    string ObjectName,
+    Vector3 InteractionPosition,
+    int Interaction,
+    bool ShowInteractions,
+    bool ShowWaits,
+    int WaitForCondition,
+    int WaitTimeMs,
+    Vector2 WaitTimeEt,
+    string RouteName);
+
+public enum RouteMovement
+{
+    Normal,
+    MountFly,
+    MountNoFly,
+}
 
 public sealed record RouteNodeSnapshot(
     Vector3 Position,

@@ -1,5 +1,6 @@
 using Dalamud.Plugin;
 using Dalamud.Plugin.Ipc;
+using Dalamud.Game.ClientState.Conditions;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.MJI;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
@@ -17,6 +18,9 @@ internal sealed class VislandAdapter
     private readonly ICallGateSubscriber<string, bool, object> startRoute;
     private readonly ICallGateSubscriber<object> stopRoute;
     private readonly ICallGateSubscriber<bool> navmeshReady;
+    private readonly ICallGateSubscriber<Vector3, bool, bool> navmeshMoveTo;
+    private readonly ICallGateSubscriber<bool> navmeshPathfindInProgress;
+    private readonly ICallGateSubscriber<bool> navmeshPathRunning;
     private readonly ICallGateSubscriber<object> navmeshStop;
     private readonly ICallGateSubscriber<string, object> lifestreamExecute;
     private readonly ICallGateSubscriber<bool> lifestreamBusy;
@@ -29,6 +33,9 @@ internal sealed class VislandAdapter
         startRoute = pluginInterface.GetIpcSubscriber<string, bool, object>("visland.StartRoute");
         stopRoute = pluginInterface.GetIpcSubscriber<object>("visland.StopRoute");
         navmeshReady = pluginInterface.GetIpcSubscriber<bool>("vnavmesh.Nav.IsReady");
+        navmeshMoveTo = pluginInterface.GetIpcSubscriber<Vector3, bool, bool>("vnavmesh.SimpleMove.PathfindAndMoveTo");
+        navmeshPathfindInProgress = pluginInterface.GetIpcSubscriber<bool>("vnavmesh.SimpleMove.PathfindInProgress");
+        navmeshPathRunning = pluginInterface.GetIpcSubscriber<bool>("vnavmesh.Path.IsRunning");
         navmeshStop = pluginInterface.GetIpcSubscriber<object>("vnavmesh.Path.Stop");
         lifestreamExecute = pluginInterface.GetIpcSubscriber<string, object>("Lifestream.ExecuteCommand");
         lifestreamBusy = pluginInterface.GetIpcSubscriber<bool>("Lifestream.IsBusy");
@@ -68,29 +75,46 @@ internal sealed class VislandAdapter
 
                 var items = new Dictionary<int, ItemSnapshot>();
                 var routeNodes = new List<RouteNodeSnapshot>();
+                var routeWaypoints = new List<RouteWaypointSnapshot>();
                 var requiresFlying = false;
-                RouteStartSnapshot? start = null;
                 if (route.TryGetProperty("Waypoints", out var waypoints))
                 {
                     foreach (var waypoint in waypoints.EnumerateArray())
                     {
                         var movementName = waypoint.TryGetProperty("Movement", out var movement) ? movement.GetString() : null;
-                        if (movementName?.Equals("MountFly", StringComparison.OrdinalIgnoreCase) == true)
+                        var routeMovement = ParseMovement(movementName);
+                        if (routeMovement == RouteMovement.MountFly)
                             requiresFlying = true;
 
                         var position = new Vector3(
                             waypoint.TryGetProperty("X", out var x) ? x.GetSingle() : 0,
                             waypoint.TryGetProperty("Y", out var y) ? y.GetSingle() : 0,
                             waypoint.TryGetProperty("Z", out var z) ? z.GetSingle() : 0);
-                        start ??= new RouteStartSnapshot(
+                        var radiusValue = waypoint.TryGetProperty("Radius", out var radius) ? Math.Max(1, radius.GetSingle()) : 3;
+                        var objectId = waypoint.TryGetProperty("InteractWithOID", out var oid) ? oid.GetUInt32() : 0;
+                        var zoneId = waypoint.TryGetProperty("ZoneID", out var zone) ? zone.GetUInt32() : 0;
+                        var nodeName = waypoint.TryGetProperty("InteractWithName", out var nodeElement) ? nodeElement.GetString()?.Trim() ?? "" : "";
+                        routeWaypoints.Add(new RouteWaypointSnapshot(
                             position,
-                            waypoint.TryGetProperty("Radius", out var radius) ? Math.Max(1, radius.GetSingle()) : 3,
-                            movementName?.Equals("MountFly", StringComparison.OrdinalIgnoreCase) == true);
+                            zoneId,
+                            radiusValue,
+                            routeMovement,
+                            waypoint.TryGetProperty("Pathfind", out var pathfind) && pathfind.GetBoolean(),
+                            objectId,
+                            nodeName,
+                            new Vector3(
+                                waypoint.TryGetProperty("iX", out var ix) ? ix.GetSingle() : 0,
+                                waypoint.TryGetProperty("iY", out var iy) ? iy.GetSingle() : 0,
+                                waypoint.TryGetProperty("iZ", out var iz) ? iz.GetSingle() : 0),
+                            ParseInteraction(waypoint.TryGetProperty("Interaction", out var interaction) ? interaction.GetString() : null),
+                            waypoint.TryGetProperty("showInteractions", out var showInteractions) && showInteractions.GetBoolean(),
+                            waypoint.TryGetProperty("showWaits", out var showWaits) && showWaits.GetBoolean(),
+                            ParseCondition(waypoint.TryGetProperty("WaitForCondition", out var waitCondition) ? waitCondition.GetString() : null),
+                            waypoint.TryGetProperty("WaitTimeMs", out var waitTime) ? waitTime.GetInt32() : 0,
+                            ReadVector2(waypoint, "WaitTimeET"),
+                            waypoint.TryGetProperty("RouteName", out var routeName) ? routeName.GetString() ?? "" : ""));
 
-                        if (!waypoint.TryGetProperty("InteractWithName", out var nodeElement))
-                            continue;
-                        var nodeName = nodeElement.GetString();
-                        if (string.IsNullOrWhiteSpace(nodeName) || !IslandResources.ByNode.TryGetValue(nodeName.Trim(), out var nodeItems))
+                        if (string.IsNullOrWhiteSpace(nodeName) || !IslandResources.ByNode.TryGetValue(nodeName, out var nodeItems))
                             continue;
                         foreach (var resource in nodeItems)
                         {
@@ -99,15 +123,21 @@ internal sealed class VislandAdapter
                                 ? existing with { PerLoop = existing.PerLoop + 1, CurrentCount = count, IsAvailable = available }
                                 : new ItemSnapshot(resource.Id, resource.Name, 1, count, available);
                         }
-                        var objectId = waypoint.TryGetProperty("InteractWithOID", out var oid) ? oid.GetUInt32() : 0;
-                        var zoneId = waypoint.TryGetProperty("ZoneID", out var zone) ? zone.GetUInt32() : 0;
                         if (objectId != 0)
-                            routeNodes.Add(new RouteNodeSnapshot(position, zoneId, objectId, nodeName.Trim(), nodeItems.Select(x => x.Id).ToArray()));
+                            routeNodes.Add(new RouteNodeSnapshot(position, zoneId, objectId, nodeName, nodeItems.Select(x => x.Id).ToArray()));
                     }
                 }
 
-                if (items.Count > 0 && start != null)
-                    routes.Add(new RouteSnapshot(name, group, requiresFlying, Compress(route.GetRawText()), items.Values.OrderBy(x => x.Name).ToList(), routeNodes, start));
+                if (items.Count > 0 && routeWaypoints.Count > 0)
+                    routes.Add(new RouteSnapshot(
+                        name,
+                        group,
+                        requiresFlying,
+                        route.TryGetProperty("Food", out var food) ? food.GetInt32() : 0,
+                        route.TryGetProperty("TargetGatherItem", out var targetGatherItem) ? targetGatherItem.GetInt32() : 0,
+                        items.Values.OrderBy(x => x.Name).ToList(),
+                        routeNodes,
+                        routeWaypoints));
             }
 
             var autoExport = false;
@@ -126,11 +156,11 @@ internal sealed class VislandAdapter
         }
     }
 
-    public bool TryStartRoute(RouteSnapshot route, out string error)
+    public bool TryStartRoute(RouteSnapshot route, int startIndex, out string error)
     {
         try
         {
-            startRoute.InvokeAction(route.SerializedRoute, true);
+            startRoute.InvokeAction(SerializeForIpc(route, startIndex), true);
             error = string.Empty;
             return true;
         }
@@ -145,41 +175,27 @@ internal sealed class VislandAdapter
     {
         get { try { return navmeshReady.HasFunction && navmeshReady.InvokeFunc(); } catch { return false; } }
     }
-    public bool TryNavigateToStart(RouteSnapshot route, Vector3 currentPosition, out string error)
+    public bool IsNavigationBusy
+    {
+        get
+        {
+            try
+            {
+                return (navmeshPathfindInProgress.HasFunction && navmeshPathfindInProgress.InvokeFunc())
+                       || (navmeshPathRunning.HasFunction && navmeshPathRunning.InvokeFunc());
+            }
+            catch { return false; }
+        }
+    }
+
+    public bool TryNavigateTo(Vector3 destination, bool fly, out string error)
     {
         try
         {
-            if (!IsNavmeshReady)
+            if (!IsNavmeshReady || !navmeshMoveTo.HasFunction)
                 throw new InvalidOperationException("vnavmesh is not installed or ready.");
-            var approach = new
-            {
-                Name = $"Stock Manager Approach: {route.Name}",
-                Group = "Stock Manager",
-                Food = 0,
-                TargetGatherItem = 0,
-                Waypoints = new[]
-                {
-                    new
-                    {
-                        X = currentPosition.X,
-                        Y = currentPosition.Y,
-                        Z = currentPosition.Z,
-                        Radius = 3f,
-                        Movement = "Normal",
-                        Pathfind = false
-                    },
-                    new
-                    {
-                        X = route.Start.Position.X,
-                        Y = route.Start.Position.Y,
-                        Z = route.Start.Position.Z,
-                        Radius = route.Start.Radius,
-                        Movement = route.Start.Fly ? "MountFly" : "MountNoFly",
-                        Pathfind = true
-                    }
-                }
-            };
-            startRoute.InvokeAction(Compress(JsonSerializer.Serialize(approach)), true);
+            if (!navmeshMoveTo.InvokeFunc(destination, fly))
+                throw new InvalidOperationException("vnavmesh rejected the pathfinding request.");
             error = string.Empty;
             return true;
         }
@@ -192,8 +208,6 @@ internal sealed class VislandAdapter
 
     public void StopNavigation()
     {
-        try { if (stopRoute.HasAction) stopRoute.InvokeAction(); }
-        catch { }
         try { if (navmeshStop.HasAction) navmeshStop.InvokeAction(); }
         catch { }
     }
@@ -229,48 +243,64 @@ internal sealed class VislandAdapter
     public RouteSnapshot CreateGeneratedRoute(IReadOnlyList<RouteNodeSnapshot> nodes, bool fly)
     {
         const string name = "Stock Manager Experimental";
-        var route = new
-        {
-            Name = name,
-            Group = "Stock Manager",
-            Food = 0,
-            TargetGatherItem = 0,
-            Waypoints = nodes.Select(node => new
-            {
-                X = node.Position.X,
-                Y = node.Position.Y,
-                Z = node.Position.Z,
-                ZoneID = node.ZoneId,
-                Radius = 3,
-                Movement = fly ? "MountFly" : "MountNoFly",
-                Pathfind = true,
-                InteractWithOID = node.ObjectId,
-                InteractWithName = node.ObjectName,
-                iX = node.Position.X,
-                iY = node.Position.Y,
-                iZ = node.Position.Z,
-                Interaction = "Standard"
-            }).ToArray()
-        };
         var items = nodes.SelectMany(x => x.ItemIds).GroupBy(x => x).Select(group =>
         {
             var resource = IslandResources.ById[group.Key];
             var (count, available) = GetItemState(group.Key);
             return new ItemSnapshot(group.Key, resource.Name, group.Count(), count, available);
         }).OrderBy(x => x.Name).ToList();
-        return new RouteSnapshot(name, "Stock Manager", fly, Compress(JsonSerializer.Serialize(route)), items, nodes.ToList(),
-            new RouteStartSnapshot(nodes[0].Position, 3, fly));
+        var waypoints = nodes.Select(node => new RouteWaypointSnapshot(
+            node.Position,
+            node.ZoneId,
+            3,
+            fly ? RouteMovement.MountFly : RouteMovement.MountNoFly,
+            true,
+            node.ObjectId,
+            node.ObjectName,
+            node.Position,
+            1,
+            true,
+            false,
+            0,
+            0,
+            Vector2.Zero,
+            "")).ToList();
+        return new RouteSnapshot(name, "Stock Manager", fly, 0, 0, items, nodes.ToList(), waypoints);
     }
 
     public RouteSnapshot CreateExportTripRoute()
     {
-        const string routeJson = "{\"Name\":\"Stock Manager Export Trip\",\"Group\":\"Stock Manager\",\"Food\":0,\"TargetGatherItem\":0,\"Waypoints\":[{\"X\":-267.729,\"Y\":40.000008,\"Z\":223.35608,\"Movement\":\"Normal\",\"Pathfind\":true},{\"X\":-267.67017,\"Y\":41.0,\"Z\":220.24205,\"Movement\":\"Normal\",\"Pathfind\":true},{\"X\":-267.57275,\"Y\":41.0,\"Z\":219.37453,\"Movement\":\"Normal\",\"Pathfind\":true},{\"X\":-266.5052,\"Y\":41.499996,\"Z\":217.80667,\"Movement\":\"Normal\",\"Pathfind\":true},{\"X\":-266.4256,\"Y\":41.0,\"Z\":209.15497,\"Movement\":\"Normal\",\"Pathfind\":true,\"InteractWithOID\":1043464,\"Interaction\":\"Standard\"}]}";
-        return new RouteSnapshot("Stock Manager Export Trip", "Stock Manager", false, Compress(routeJson), [], [],
-            new RouteStartSnapshot(new Vector3(-267.729f, 40.000008f, 223.35608f), 3, false));
+        var positions = new[]
+        {
+            new Vector3(-267.729f, 40.000008f, 223.35608f),
+            new Vector3(-267.67017f, 41f, 220.24205f),
+            new Vector3(-267.57275f, 41f, 219.37453f),
+            new Vector3(-266.5052f, 41.499996f, 217.80667f),
+            new Vector3(-266.4256f, 41f, 209.15497f),
+        };
+        var waypoints = positions.Select((position, index) => new RouteWaypointSnapshot(
+            position,
+            0,
+            3,
+            RouteMovement.Normal,
+            true,
+            index == positions.Length - 1 ? 1043464u : 0,
+            "",
+            Vector3.Zero,
+            1,
+            index == positions.Length - 1,
+            false,
+            0,
+            0,
+            Vector2.Zero,
+            "")).ToList();
+        return new RouteSnapshot("Stock Manager Export Trip", "Stock Manager", false, 0, 0, [], [], waypoints);
     }
 
     public void Stop()
     {
+        try { if (stopRoute.HasAction) stopRoute.InvokeAction(); }
+        catch { }
         StopNavigation();
     }
 
@@ -303,6 +333,72 @@ internal sealed class VislandAdapter
             error = ex.GetBaseException().Message;
             return false;
         }
+    }
+
+    internal static string SerializeForIpc(RouteSnapshot route, int startIndex)
+    {
+        if (route.Waypoints.Count == 0)
+            throw new InvalidOperationException($"Route '{route.Name}' has no waypoints.");
+        startIndex = Math.Clamp(startIndex, 0, route.Waypoints.Count - 1);
+        var ordered = route.Waypoints.Skip(startIndex).Concat(route.Waypoints.Take(startIndex));
+        var payload = new
+        {
+            route.Name,
+            route.Group,
+            route.Food,
+            route.TargetGatherItem,
+            Waypoints = ordered.Select(waypoint => new
+            {
+                Position = new { waypoint.Position.X, waypoint.Position.Y, waypoint.Position.Z },
+                ZoneID = waypoint.ZoneId,
+                waypoint.Radius,
+                Movement = (int)waypoint.Movement,
+                waypoint.Pathfind,
+                InteractWithOID = waypoint.ObjectId,
+                InteractWithName = waypoint.ObjectName,
+                InteractWithPosition = new
+                {
+                    X = waypoint.InteractionPosition.X,
+                    Y = waypoint.InteractionPosition.Y,
+                    Z = waypoint.InteractionPosition.Z,
+                },
+                showInteractions = waypoint.ShowInteractions,
+                waypoint.Interaction,
+                showWaits = waypoint.ShowWaits,
+                waypoint.WaitForCondition,
+                waypoint.WaitTimeMs,
+                WaitTimeET = new { X = waypoint.WaitTimeEt.X, Y = waypoint.WaitTimeEt.Y },
+                waypoint.RouteName,
+            }).ToArray(),
+        };
+        return Compress(JsonSerializer.Serialize(payload));
+    }
+
+    private static RouteMovement ParseMovement(string? value) => value?.ToLowerInvariant() switch
+    {
+        "mountfly" => RouteMovement.MountFly,
+        "mountnofly" => RouteMovement.MountNoFly,
+        _ => RouteMovement.Normal,
+    };
+
+    private static int ParseInteraction(string? value) => value?.ToLowerInvariant() switch
+    {
+        "none" => 0,
+        "startroute" => 9,
+        "nodescan" => 12,
+        _ => 1,
+    };
+
+    private static int ParseCondition(string? value) =>
+        Enum.TryParse<ConditionFlag>(value, true, out var condition) ? (int)condition : 0;
+
+    private static Vector2 ReadVector2(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out var value) || value.ValueKind != JsonValueKind.Object)
+            return Vector2.Zero;
+        return new Vector2(
+            value.TryGetProperty("X", out var x) ? x.GetSingle() : 0,
+            value.TryGetProperty("Y", out var y) ? y.GetSingle() : 0);
     }
 
     private static string Compress(string json)

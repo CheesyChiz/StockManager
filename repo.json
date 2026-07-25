@@ -3,11 +3,11 @@
     "Author": "CheesyChiz",
     "Name": "Stock Manager",
     "Punchline": "Balances Island Sanctuary stock with imported Visland routes.",
-    "Description": "Check the Island resources you want, set their stock levels, and let Stock Manager choose the best imported Visland routes automatically. Uses vnavmesh to reach route starts, detects flight and tool access, supports Lifestream travel, surplus export, run statistics, and /sm control commands.",
+    "Description": "Check the Island resources you want, set their stock levels, and let Stock Manager choose the best imported Visland routes automatically. Uses vnavmesh from your current position, supports roulette or a selected unlocked mount, detects flight and tool access, and includes Lifestream travel, surplus export, run statistics, and /sm commands.",
     "IconUrl": "https://raw.githubusercontent.com/CheesyChiz/StockManager/main/assets/icon.png",
-    "Changelog": "Fixed export-cap validation and route-start navigation. Added /sm control commands and per-run collection statistics.",
+    "Changelog": "Fixed Visland route serialization and direct vnavmesh startup. Added a Settings tab with mount roulette or a specific unlocked mount, plus closest-waypoint starts when already near a route.",
     "InternalName": "StockManager",
-    "AssemblyVersion": "1.4.1.0",
+    "AssemblyVersion": "1.4.2.0",
     "TestingAssemblyVersion": null,
     "RepoUrl": "https://github.com/CheesyChiz/StockManager",
     "ApplicableVersion": "any",
@@ -19,9 +19,9 @@
     ],
     "IsHide": false,
     "IsTestingExclusive": false,
-    "DownloadLinkInstall": "https://github.com/CheesyChiz/StockManager/releases/download/v1.4.1/StockManager.zip",
-    "DownloadLinkUpdate": "https://github.com/CheesyChiz/StockManager/releases/download/v1.4.1/StockManager.zip",
+    "DownloadLinkInstall": "https://github.com/CheesyChiz/StockManager/releases/download/v1.4.2/StockManager.zip",
+    "DownloadLinkUpdate": "https://github.com/CheesyChiz/StockManager/releases/download/v1.4.2/StockManager.zip",
     "DownloadLinkTesting": null,
-    "LastUpdate": 1784947100
+    "LastUpdate": 1784948100
   }
 ]
