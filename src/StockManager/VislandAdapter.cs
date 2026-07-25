@@ -2,10 +2,12 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Ipc;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.MJI;
+using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
 using System.Reflection;
+using System.Numerics;
 
 namespace StockManager;
 
@@ -14,6 +16,10 @@ internal sealed class VislandAdapter
     private readonly ICallGateSubscriber<bool> isRouteRunning;
     private readonly ICallGateSubscriber<string, bool, object> startRoute;
     private readonly ICallGateSubscriber<object> stopRoute;
+    private readonly ICallGateSubscriber<bool> navmeshReady;
+    private readonly ICallGateSubscriber<string, object> lifestreamExecute;
+    private readonly ICallGateSubscriber<bool> lifestreamBusy;
+    private readonly ICallGateSubscriber<object> lifestreamAbort;
     private readonly string configPath;
 
     public VislandAdapter(IDalamudPluginInterface pluginInterface)
@@ -21,6 +27,10 @@ internal sealed class VislandAdapter
         isRouteRunning = pluginInterface.GetIpcSubscriber<bool>("visland.IsRouteRunning");
         startRoute = pluginInterface.GetIpcSubscriber<string, bool, object>("visland.StartRoute");
         stopRoute = pluginInterface.GetIpcSubscriber<object>("visland.StopRoute");
+        navmeshReady = pluginInterface.GetIpcSubscriber<bool>("vnavmesh.Nav.IsReady");
+        lifestreamExecute = pluginInterface.GetIpcSubscriber<string, object>("Lifestream.ExecuteCommand");
+        lifestreamBusy = pluginInterface.GetIpcSubscriber<bool>("Lifestream.IsBusy");
+        lifestreamAbort = pluginInterface.GetIpcSubscriber<object>("Lifestream.Abort");
         var configRoot = pluginInterface.ConfigDirectory.Parent?.FullName
                          ?? throw new InvalidOperationException("Dalamud configuration directory is unavailable.");
         configPath = Path.Combine(configRoot, "visland.json");
@@ -55,6 +65,7 @@ internal sealed class VislandAdapter
                     continue;
 
                 var items = new Dictionary<int, ItemSnapshot>();
+                var routeNodes = new List<RouteNodeSnapshot>();
                 var requiresFlying = false;
                 if (route.TryGetProperty("Waypoints", out var waypoints))
                 {
@@ -76,11 +87,19 @@ internal sealed class VislandAdapter
                                 ? existing with { PerLoop = existing.PerLoop + 1, CurrentCount = count, IsAvailable = available }
                                 : new ItemSnapshot(resource.Id, resource.Name, 1, count, available);
                         }
+                        var position = new Vector3(
+                            waypoint.TryGetProperty("X", out var x) ? x.GetSingle() : 0,
+                            waypoint.TryGetProperty("Y", out var y) ? y.GetSingle() : 0,
+                            waypoint.TryGetProperty("Z", out var z) ? z.GetSingle() : 0);
+                        var objectId = waypoint.TryGetProperty("InteractWithOID", out var oid) ? oid.GetUInt32() : 0;
+                        var zoneId = waypoint.TryGetProperty("ZoneID", out var zone) ? zone.GetUInt32() : 0;
+                        if (objectId != 0)
+                            routeNodes.Add(new RouteNodeSnapshot(position, zoneId, objectId, nodeName.Trim(), nodeItems.Select(x => x.Id).ToArray()));
                     }
                 }
 
                 if (items.Count > 0)
-                    routes.Add(new RouteSnapshot(name, group, requiresFlying, Compress(route.GetRawText()), items.Values.OrderBy(x => x.Name).ToList()));
+                    routes.Add(new RouteSnapshot(name, group, requiresFlying, Compress(route.GetRawText()), items.Values.OrderBy(x => x.Name).ToList(), routeNodes));
             }
 
             var autoExport = false;
@@ -88,7 +107,7 @@ internal sealed class VislandAdapter
             {
                 autoExport = exportConfig.TryGetProperty("AutoSell", out var autoSell) && autoSell.GetBoolean();
             }
-            snapshot = new VislandSnapshot(isRouteRunning.InvokeFunc(), autoExport, routes);
+            snapshot = new VislandSnapshot(isRouteRunning.InvokeFunc(), autoExport, GetFlightUnlocked(), routes);
             error = string.Empty;
             return true;
         }
@@ -112,6 +131,74 @@ internal sealed class VislandAdapter
             error = ex.GetBaseException().Message;
             return false;
         }
+    }
+
+    public bool IsNavmeshReady
+    {
+        get { try { return navmeshReady.HasFunction && navmeshReady.InvokeFunc(); } catch { return false; } }
+    }
+    public bool IsLifestreamAvailable => lifestreamExecute.HasAction && lifestreamBusy.HasFunction;
+    public bool IsLifestreamBusy
+    {
+        get { try { return IsLifestreamAvailable && lifestreamBusy.InvokeFunc(); } catch { return false; } }
+    }
+
+    public bool TryTravelToIsland(out string error)
+    {
+        try
+        {
+            if (!IsLifestreamAvailable) throw new InvalidOperationException("Lifestream is not installed or loaded.");
+            if (IsLifestreamBusy) throw new InvalidOperationException("Lifestream is currently busy.");
+            lifestreamExecute.InvokeAction("island");
+            error = string.Empty;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.GetBaseException().Message;
+            return false;
+        }
+    }
+
+    public void AbortLifestream()
+    {
+        try { if (lifestreamAbort.HasAction) lifestreamAbort.InvokeAction(); }
+        catch { }
+    }
+
+    public RouteSnapshot CreateGeneratedRoute(IReadOnlyList<RouteNodeSnapshot> nodes, bool fly)
+    {
+        const string name = "Stock Manager Experimental";
+        var route = new
+        {
+            Name = name,
+            Group = "Stock Manager",
+            Food = 0,
+            TargetGatherItem = 0,
+            Waypoints = nodes.Select(node => new
+            {
+                X = node.Position.X,
+                Y = node.Position.Y,
+                Z = node.Position.Z,
+                ZoneID = node.ZoneId,
+                Radius = 3,
+                Movement = fly ? "MountFly" : "MountNoFly",
+                Pathfind = true,
+                InteractWithOID = node.ObjectId,
+                InteractWithName = node.ObjectName,
+                iX = node.Position.X,
+                iY = node.Position.Y,
+                iZ = node.Position.Z,
+                Interaction = "Standard"
+            }).ToArray()
+        };
+        var items = nodes.SelectMany(x => x.ItemIds).GroupBy(x => x).Select(group =>
+        {
+            var resource = IslandResources.ById[group.Key];
+            var (count, available) = GetItemState(group.Key);
+            return new ItemSnapshot(group.Key, resource.Name, group.Count(), count, available);
+        }).OrderBy(x => x.Name).ToList();
+        return new RouteSnapshot(name, "Stock Manager", fly, Compress(JsonSerializer.Serialize(route)), items, nodes.ToList());
     }
 
     public bool TryStartExportTrip(out string error)
@@ -183,6 +270,14 @@ internal sealed class VislandAdapter
         var count = inventory == null ? 0 : (int)inventory->GetInventoryItemCount((uint)itemId);
         return (count, manager == null || !manager->IsItemLocked((uint)itemId));
     }
+
+    private static unsafe bool? GetFlightUnlocked()
+    {
+        var manager = MJIManager.Instance();
+        if (manager == null || !manager->IsPlayerInSanctuary) return null;
+        var playerState = PlayerState.Instance();
+        return playerState != null && playerState->CanFly;
+    }
 }
 
 internal static class IslandResources
@@ -216,6 +311,9 @@ internal static class IslandResources
         ["tualong tree"] = [R(37553, "Branch"), R(37560, "Log"), R(39224, "Resin")],
         ["yellowish rock"] = [R(37554, "Stone"), R(41631, "Yellow Copper Ore"), R(41632, "Gold Ore")],
     };
+
+    public static readonly Dictionary<int, ItemResource> ById = ByNode.Values.SelectMany(x => x).GroupBy(x => x.Id)
+        .ToDictionary(x => x.Key, x => x.First());
 }
 
 internal sealed record ItemResource(int Id, string Name);

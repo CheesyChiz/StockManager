@@ -24,11 +24,16 @@ public sealed class Plugin : IDalamudPlugin
     private DateTime nextStartAttempt = DateTime.MinValue;
     private DateTime exportTripStarted;
     private DateTime closeExportAfter = DateTime.MaxValue;
+    private DateTime nextTravelAttempt = DateTime.MinValue;
     private bool windowOpen;
     private bool exportTrip;
     private bool exportSubmitted;
+    private bool travelRequested;
     private string status = "Waiting for Visland...";
     private string? activeRoute;
+    private RouteSnapshot? experimentalRoute;
+    private string experimentalStatus = "Uses enabled resources and nodes found in imported Visland routes.";
+    private int experimentalNodeLimit = 18;
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
@@ -62,16 +67,18 @@ public sealed class Plugin : IDalamudPlugin
 
     private void MigrateConfiguration()
     {
-        if (config.Version >= 4) return;
-        if (config.CompletionAction == CompletionAction.FarmAndExport)
+        if (config.Version < 4)
         {
-            if (config.LegacyBulkSellLimit.HasValue) config.BulkTarget = config.LegacyBulkSellLimit.Value;
-            if (config.LegacySellLimits is { Count: > 0 }) config.Targets = new Dictionary<int, int>(config.LegacySellLimits);
+            if (config.CompletionAction == CompletionAction.FarmAndExport)
+            {
+                if (config.LegacyBulkSellLimit.HasValue) config.BulkTarget = config.LegacyBulkSellLimit.Value;
+                if (config.LegacySellLimits is { Count: > 0 }) config.Targets = new Dictionary<int, int>(config.LegacySellLimits);
+            }
+            config.LegacyBulkSellLimit = null;
+            config.LegacySellLimits = null;
+            config.Version = 4;
+            Save();
         }
-        config.LegacyBulkSellLimit = null;
-        config.LegacySellLimits = null;
-        config.Version = 4;
-        Save();
     }
 
     private void OnUpdate(IFramework _)
@@ -81,9 +88,31 @@ public sealed class Plugin : IDalamudPlugin
         if (!adapter.TryGetSnapshot(out snapshot, out var error)) { status = error; snapshot = null; return; }
         if (snapshot == null) { status = "Visland returned no route data."; return; }
         InitializeDefaults(snapshot);
+        MigrateRouteSelections(snapshot);
         if (!config.Enabled) { status = "Stopped"; return; }
         if (!services.ClientState.IsLoggedIn) { status = "Log in and travel to Island Sanctuary before starting."; return; }
-        if (TryGetExportValidationError(snapshot, out var validationError))
+        if (snapshot.FlightUnlocked == null)
+        {
+            if (config.AutoTravelToIsland && !travelRequested && DateTime.UtcNow >= nextTravelAttempt)
+            {
+                if (adapter.TryTravelToIsland(out error))
+                {
+                    travelRequested = true;
+                    status = "Lifestream is taking you to your Island Sanctuary...";
+                }
+                else
+                {
+                    status = $"Could not travel with Lifestream: {error}";
+                    nextTravelAttempt = DateTime.UtcNow.AddSeconds(5);
+                }
+            }
+            else if (travelRequested)
+                status = adapter.IsLifestreamBusy ? "Lifestream is taking you to your Island Sanctuary..." : "Waiting to arrive on your Island Sanctuary...";
+            else status = "Travel to your Island Sanctuary before starting.";
+            return;
+        }
+        travelRequested = false;
+        if (TryGetStartValidationError(snapshot, out var validationError))
         {
             config.Enabled = false; adapter.Stop(); Save(); status = validationError; return;
         }
@@ -137,10 +166,23 @@ public sealed class Plugin : IDalamudPlugin
         nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
     }
 
+    private void MigrateRouteSelections(VislandSnapshot data)
+    {
+        if (config.Version >= 6) return;
+        var oldRoutes = data.Routes.Where(x => config.LegacyExcludedRoutes?.Contains(x.Name) != true);
+        if (config.LegacyMovementMode != 1) oldRoutes = oldRoutes.Where(x => !x.RequiresFlying);
+        config.EnabledItems = oldRoutes.SelectMany(x => x.Items).Select(x => x.Id).Distinct()
+            .Where(x => config.Targets.TryGetValue(x, out var target) && target > 0).ToHashSet();
+        config.LegacyExcludedRoutes = null;
+        config.LegacyMovementMode = null;
+        config.Version = 6;
+        Save();
+    }
+
     private (RouteSnapshot Route, ItemSnapshot Item)? SelectNextRoute(VislandSnapshot data)
     {
-        var items = UniqueItems(data).Where(x => x.IsAvailable)
-            .Where(x => config.Targets.TryGetValue(x.Id, out var target) && target > x.CurrentCount)
+        var items = ManagedItems(data).Where(x => x.IsAvailable)
+            .Where(x => config.Targets[x.Id] > x.CurrentCount)
             .OrderBy(x => (double)x.CurrentCount / config.Targets[x.Id]).ThenBy(x => x.CurrentCount);
         foreach (var item in items)
         {
@@ -155,13 +197,13 @@ public sealed class Plugin : IDalamudPlugin
 
     private (RouteSnapshot Route, ItemSnapshot Item)? SelectCowrieRoute(VislandSnapshot data) =>
         CompatibleRoutes(data).SelectMany(route => route.Items.Where(x => x.IsAvailable).Select(item => (Route: route, Item: item)))
-            .Where(x => config.Targets.TryGetValue(x.Item.Id, out var target) && target is > 0 and < 999)
+            .Where(x => config.EnabledItems.Contains(x.Item.Id) && config.Targets.TryGetValue(x.Item.Id, out var target) && target is > 0 and < 999)
             .Where(x => x.Item.CurrentCount < ExportTrigger(x.Item.Id))
             .OrderBy(x => (double)x.Item.CurrentCount / Math.Max(1, ExportTrigger(x.Item.Id)))
             .ThenByDescending(x => x.Item.PerLoop).Select(x => ((RouteSnapshot, ItemSnapshot)?)x).FirstOrDefault();
 
     private int ExportTrigger(int itemId) => config.Targets[itemId] + config.ExportBatch;
-    private bool IsExportDue(ItemSnapshot item) => item.IsAvailable && config.Targets.TryGetValue(item.Id, out var target)
+    private bool IsExportDue(ItemSnapshot item) => item.IsAvailable && config.EnabledItems.Contains(item.Id) && config.Targets.TryGetValue(item.Id, out var target)
         && target is > 0 and < 999 && item.CurrentCount >= ExportTrigger(item.Id);
 
     private bool TryGetExportValidationError(VislandSnapshot data, out string error)
@@ -177,18 +219,35 @@ public sealed class Plugin : IDalamudPlugin
         return true;
     }
 
+    private bool TryGetStartValidationError(VislandSnapshot data, out string error)
+    {
+        if (TryGetExportValidationError(data, out error)) return true;
+        if (config.EnabledItems.Count == 0)
+        {
+            error = "Enable at least one resource before starting.";
+            return true;
+        }
+        if (data.FlightUnlocked != null && !ManagedItems(data).Any(x => x.IsAvailable))
+        {
+            error = "No enabled resource is currently unlocked and served by a compatible imported route.";
+            return true;
+        }
+        error = string.Empty;
+        return false;
+    }
+
     private IEnumerable<RouteSnapshot> CompatibleRoutes(VislandSnapshot data) => data.Routes
-        .Where(x => !config.ExcludedRoutes.Contains(x.Name))
-        .Where(x => config.MovementMode == RouteMovementMode.GroundAndFlying || !x.RequiresFlying);
+        .Where(x => data.FlightUnlocked == true || !x.RequiresFlying);
 
     private static IEnumerable<ItemSnapshot> UniqueItems(VislandSnapshot data) =>
         data.Routes.SelectMany(x => x.Items).GroupBy(x => x.Id).Select(x => x.First());
 
-    private IEnumerable<ItemSnapshot> ManagedItems(VislandSnapshot data) =>
-        CompatibleRoutes(data).SelectMany(x => x.Items).GroupBy(x => x.Id).Select(x => x.First());
+    private IEnumerable<ItemSnapshot> ManagedItems(VislandSnapshot data) => CompatibleRoutes(data)
+        .SelectMany(x => x.Items).GroupBy(x => x.Id).Select(x => x.First())
+        .Where(x => config.EnabledItems.Contains(x.Id) && config.Targets.TryGetValue(x.Id, out var target) && target > 0);
 
     private double RouteUtility(RouteSnapshot route) => route.Items.Sum(item =>
-        item.IsAvailable && config.Targets.TryGetValue(item.Id, out var target) && target > 0 && item.CurrentCount < target
+        item.IsAvailable && config.EnabledItems.Contains(item.Id) && config.Targets.TryGetValue(item.Id, out var target) && target > 0 && item.CurrentCount < target
             ? ((double)(target - item.CurrentCount) / target) * item.PerLoop : 0);
 
     private void InitializeDefaults(VislandSnapshot data)
@@ -212,16 +271,27 @@ public sealed class Plugin : IDalamudPlugin
         if (ImGui.Button(config.Enabled ? "Stop automation" : "Start automation"))
         {
             var wantsEnabled = !config.Enabled;
-            if (wantsEnabled && snapshot != null && TryGetExportValidationError(snapshot, out var error))
+            if (wantsEnabled && snapshot != null && TryGetStartValidationError(snapshot, out var error))
                 status = error;
             else
             {
-                config.Enabled = wantsEnabled; exportTrip = false; activeRoute = null; nextStartAttempt = DateTime.MinValue;
-                if (!config.Enabled) adapter.Stop(); Save();
+                var wasTravelRequested = travelRequested;
+                config.Enabled = wantsEnabled; exportTrip = false; travelRequested = false; activeRoute = null; nextStartAttempt = DateTime.MinValue;
+                if (!config.Enabled) { adapter.Stop(); if (wasTravelRequested) adapter.AbortLifestream(); }
+                Save();
             }
         }
         ImGui.SameLine();
-        if (ImGui.Button("Emergency stop")) { config.Enabled = false; exportTrip = false; adapter.Stop(); Save(); }
+        if (ImGui.Button("Emergency stop")) { config.Enabled = false; exportTrip = false; adapter.Stop(); adapter.AbortLifestream(); travelRequested = false; Save(); }
+        ImGui.SameLine();
+        var canTravel = snapshot?.FlightUnlocked == null && adapter.IsLifestreamAvailable && !adapter.IsLifestreamBusy;
+        if (!canTravel) ImGui.BeginDisabled();
+        if (ImGui.Button("Travel to Island"))
+        {
+            if (adapter.TryTravelToIsland(out var error)) { travelRequested = true; status = "Lifestream is taking you to your Island Sanctuary..."; }
+            else status = $"Could not travel with Lifestream: {error}";
+        }
+        if (!canTravel) ImGui.EndDisabled();
         ImGui.Separator();
 
         DrawBehavior();
@@ -230,9 +300,9 @@ public sealed class Plugin : IDalamudPlugin
         else if (ImGui.BeginTable("MainPanels", 2, ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.Resizable))
         {
             ImGui.TableSetupColumn("Resources", ImGuiTableColumnFlags.WidthStretch, 1.35f);
-            ImGui.TableSetupColumn("Routes", ImGuiTableColumnFlags.WidthStretch, 1f);
+            ImGui.TableSetupColumn("Automatic routes", ImGuiTableColumnFlags.WidthStretch, 1f);
             ImGui.TableNextColumn(); ImGui.TextUnformatted("Resources"); ImGui.Separator(); DrawTargets(snapshot);
-            ImGui.TableNextColumn(); ImGui.TextUnformatted("Routes"); ImGui.Separator();
+            ImGui.TableNextColumn(); ImGui.TextUnformatted("Automatic routes"); ImGui.Separator();
             if (ImGui.BeginChild("RoutesPanel", new Vector2(0, -1), true)) DrawRoutes(snapshot);
             ImGui.EndChild(); ImGui.EndTable();
         }
@@ -242,8 +312,21 @@ public sealed class Plugin : IDalamudPlugin
     private void DrawTargets(VislandSnapshot data)
     {
         var targetLabel = config.CompletionAction == CompletionAction.Stop ? "Target stock" : "Sell above";
+        var compatibleRoutes = CompatibleRoutes(data).ToList();
+        var allItemIds = UniqueItems(data).Select(x => x.Id).ToList();
+        var selectableIds = UniqueItems(data).Where(x => x.IsAvailable && compatibleRoutes.Any(route => route.Items.Any(y => y.Id == x.Id)))
+            .Select(x => x.Id).ToList();
+        var allEnabled = selectableIds.Count > 0 && selectableIds.All(config.EnabledItems.Contains);
+        if (ImGui.Checkbox("Enable all available resources", ref allEnabled))
+        {
+            foreach (var id in allEnabled ? selectableIds : allItemIds)
+            {
+                if (allEnabled) config.EnabledItems.Add(id); else config.EnabledItems.Remove(id);
+            }
+            Save();
+        }
         var bulk = config.BulkTarget; ImGui.SetNextItemWidth(75);
-        if (ImGui.InputInt($"{targetLabel} for all", ref bulk)) { config.BulkTarget = Math.Clamp(bulk, 0, 999); Save(); }
+        if (ImGui.InputInt($"{targetLabel} for all", ref bulk)) { config.BulkTarget = Math.Clamp(bulk, 1, 999); Save(); }
         ImGui.SameLine(); if (ImGui.Button("Apply##farm"))
         { foreach (var id in config.Targets.Keys.ToList()) config.Targets[id] = config.BulkTarget; Save(); }
         if (config.CompletionAction == CompletionAction.FarmAndExport)
@@ -261,41 +344,213 @@ public sealed class Plugin : IDalamudPlugin
         foreach (var item in UniqueItems(data).OrderBy(x => x.Name))
         {
             ImGui.TableNextRow(); ImGui.TableNextColumn();
-            if (!item.IsAvailable) ImGui.TextDisabled($"{item.Name} (locked)"); else ImGui.TextUnformatted(item.Name);
+            var enabled = config.EnabledItems.Contains(item.Id);
+            var hasCompatibleRoute = compatibleRoutes.Any(route => route.Items.Any(x => x.Id == item.Id));
+            var canFarm = item.IsAvailable && hasCompatibleRoute;
+            if (!canFarm) ImGui.BeginDisabled();
+            if (ImGui.Checkbox($"##enabled{item.Id}", ref enabled))
+            {
+                if (enabled) config.EnabledItems.Add(item.Id); else config.EnabledItems.Remove(item.Id);
+                Save();
+            }
+            if (!canFarm) ImGui.EndDisabled();
+            ImGui.SameLine();
+            if (!item.IsAvailable) ImGui.TextDisabled($"{item.Name} (tool locked)");
+            else if (!hasCompatibleRoute) ImGui.TextDisabled($"{item.Name} (flight unavailable)");
+            else ImGui.TextUnformatted(item.Name);
             ImGui.TableNextColumn(); ImGui.TextUnformatted(item.CurrentCount.ToString());
             ImGui.TableNextColumn(); var target = config.Targets[item.Id]; ImGui.SetNextItemWidth(65);
             if (!item.IsAvailable) ImGui.BeginDisabled();
             if (ImGui.InputInt($"##target{item.Id}", ref target))
-            { config.Targets[item.Id] = Math.Clamp(target, 0, 999); Save(); }
+            { config.Targets[item.Id] = Math.Clamp(target, 1, 999); Save(); }
             if (!item.IsAvailable) ImGui.EndDisabled();
             ImGui.TableNextColumn();
-            ImGui.TextUnformatted(!item.IsAvailable ? "ignored" : target <= 0 ? "disabled" : item.CurrentCount >= target ? "done" : $"{item.CurrentCount * 100 / target}%");
+            ImGui.TextUnformatted(!canFarm ? "ignored" : !enabled ? "off" : item.CurrentCount >= target ? "done" : $"{item.CurrentCount * 100 / target}%");
         }
         ImGui.EndTable();
     }
 
     private void DrawBehavior()
     {
-        var movement = (int)config.MovementMode; ImGui.SetNextItemWidth(220);
-        if (ImGui.Combo("Allowed routes", ref movement, "Ground only\0Ground and flying\0")) { config.MovementMode = (RouteMovementMode)movement; Save(); }
         var completion = (int)config.CompletionAction; ImGui.SetNextItemWidth(220);
         if (ImGui.Combo("When targets are complete", ref completion, "Stop\0Farm and export for cowries\0")) { config.CompletionAction = (CompletionAction)completion; Save(); }
+        var autoTravel = config.AutoTravelToIsland;
+        if (!adapter.IsLifestreamAvailable) ImGui.BeginDisabled();
+        if (ImGui.Checkbox("Travel to Island with Lifestream when starting", ref autoTravel)) { config.AutoTravelToIsland = autoTravel; Save(); }
+        if (!adapter.IsLifestreamAvailable) ImGui.EndDisabled();
+        if (!adapter.IsLifestreamAvailable) ImGui.TextDisabled("Optional: install Lifestream to enable Island travel.");
         if (config.CompletionAction != CompletionAction.FarmAndExport) return;
     }
 
     private void DrawRoutes(VislandSnapshot data)
     {
-        ImGui.TextDisabled("Ground-only mode automatically ignores routes containing MountFly waypoints.");
-        foreach (var route in data.Routes.OrderBy(x => x.RequiresFlying).ThenBy(x => x.Name))
+        var compatible = CompatibleRoutes(data).ToList();
+        ImGui.TextWrapped("Routes are selected automatically for enabled resources.");
+        if (data.FlightUnlocked == true) ImGui.TextDisabled("Island flight is unlocked; ground and flying routes are available.");
+        else if (data.FlightUnlocked == false) ImGui.TextDisabled("Island flight is locked; flying routes and their exclusive resources are ignored.");
+        else ImGui.TextDisabled("Travel to your Island to detect flight access; only ground routes are available until then.");
+        ImGui.TextDisabled($"Considering {compatible.Count} of {data.Routes.Count} imported Island routes.");
+        ImGui.Spacing();
+        foreach (var item in UniqueItems(data).Where(x => config.EnabledItems.Contains(x.Id)).OrderBy(x => x.Name))
         {
-            var compatible = config.MovementMode == RouteMovementMode.GroundAndFlying || !route.RequiresFlying;
-            var enabled = !config.ExcludedRoutes.Contains(route.Name);
-            if (!compatible) ImGui.BeginDisabled();
-            if (ImGui.Checkbox($"{(route.RequiresFlying ? "[Flying]" : "[Ground]")} {route.Name}##route", ref enabled))
-            { if (enabled) config.ExcludedRoutes.Remove(route.Name); else config.ExcludedRoutes.Add(route.Name); Save(); }
-            if (!compatible) ImGui.EndDisabled();
+            var candidates = compatible.Select(route => (Route: route, Item: route.Items.FirstOrDefault(x => x.Id == item.Id)))
+                .Where(x => x.Item != null).OrderByDescending(x => x.Item!.PerLoop).ThenByDescending(x => RouteUtility(x.Route)).ToList();
+            if (candidates.Count == 0) ImGui.TextColored(new Vector4(1f, .45f, .3f, 1), $"{item.Name}: no compatible route");
+            else
+            {
+                var best = candidates[0];
+                ImGui.TextUnformatted($"{item.Name}: {best.Route.Name}");
+                ImGui.TextDisabled($"  best of {candidates.Count}; about {best.Item!.PerLoop} node(s) per loop");
+            }
+        }
+
+        ImGui.Spacing(); ImGui.Separator();
+        DrawExperimentalRouteGenerator(data);
+    }
+
+    private void DrawExperimentalRouteGenerator(VislandSnapshot data)
+    {
+        if (!ImGui.CollapsingHeader("Experimental route generator")) return;
+        ImGui.TextWrapped("Builds a temporary mixed-resource route from gathering nodes already present in imported Visland routes.");
+        ImGui.TextColored(new Vector4(1f, .75f, .25f, 1), "Experimental: inspect and test the result before relying on it.");
+        var limit = experimentalNodeLimit; ImGui.SetNextItemWidth(75);
+        if (ImGui.InputInt("Maximum nodes", ref limit)) experimentalNodeLimit = Math.Clamp(limit, 11, 30);
+        ImGui.TextDisabled("At least 11 unique nodes are used to support Island node respawns.");
+
+        var canGenerate = data.FlightUnlocked != null && !config.Enabled && !data.IsRunning;
+        if (!canGenerate) ImGui.BeginDisabled();
+        if (ImGui.Button("Generate preview")) GenerateExperimentalRoute(data);
+        if (!canGenerate) ImGui.EndDisabled();
+        ImGui.SameLine();
+        var canRun = canGenerate && experimentalRoute != null && adapter.IsNavmeshReady;
+        if (!canRun) ImGui.BeginDisabled();
+        if (ImGui.Button("Run one test loop") && experimentalRoute != null)
+        {
+            if (adapter.TryStartRoute(experimentalRoute, out var error))
+                experimentalStatus = "Test loop started in Visland. Use Emergency stop if needed.";
+            else experimentalStatus = $"Visland rejected the generated route: {error}";
+        }
+        if (!canRun) ImGui.EndDisabled();
+        ImGui.TextWrapped(experimentalStatus);
+        if (!adapter.IsNavmeshReady) ImGui.TextDisabled("vnavmesh must be installed and ready to test a generated route.");
+    }
+
+    private void GenerateExperimentalRoute(VislandSnapshot data)
+    {
+        experimentalRoute = null;
+        var compatible = CompatibleRoutes(data).ToList();
+        var activeItems = UniqueItems(data)
+            .Where(x => x.IsAvailable && config.EnabledItems.Contains(x.Id) && config.Targets.TryGetValue(x.Id, out var target) && target > 0)
+            .Where(x => compatible.Any(route => route.Items.Any(item => item.Id == x.Id)))
+            .OrderBy(x => (double)x.CurrentCount / Math.Max(1, config.Targets[x.Id])).ToList();
+        if (activeItems.Count == 0)
+        {
+            experimentalStatus = "Enable at least one unlocked resource with a compatible route.";
+            return;
+        }
+
+        var availableIds = UniqueItems(data).Where(x => x.IsAvailable).Select(x => x.Id).ToHashSet();
+        var allNodes = compatible.SelectMany(x => x.Nodes).Where(x => x.ItemIds.Any(availableIds.Contains))
+            .GroupBy(NodeKey).Select(x => x.First()).ToList();
+        var activeIds = activeItems.Select(x => x.Id).ToHashSet();
+        var targetNodes = allNodes.Where(x => x.ItemIds.Any(activeIds.Contains)).ToList();
+        if (targetNodes.Count == 0)
+        {
+            experimentalStatus = "No usable gathering nodes were found for the enabled resources.";
+            return;
+        }
+
+        var selected = SelectBalancedNodes(targetNodes, activeItems, experimentalNodeLimit);
+        while (selected.Count < 11)
+        {
+            var support = allNodes.Where(x => !selected.Contains(x))
+                .OrderBy(x => selected.Min(y => Vector3.Distance(x.Position, y.Position))).FirstOrDefault();
+            if (support == null) break;
+            selected.Add(support);
+        }
+        if (selected.Count < 11)
+        {
+            experimentalStatus = $"Only {selected.Count} unique nodes are available; at least 11 are required for a stable loop.";
+            return;
+        }
+
+        var ordered = OptimizeCycle(selected);
+        experimentalRoute = adapter.CreateGeneratedRoute(ordered, data.FlightUnlocked == true);
+        var wantedNodes = ordered.Count(x => x.ItemIds.Any(activeIds.Contains));
+        experimentalStatus = $"Preview ready: {ordered.Count} nodes ({wantedNodes} target, {ordered.Count - wantedNodes} respawn support), "
+                             + $"~{CycleLength(ordered):F0} yalms straight-line cycle. This preview is not saved to Visland.";
+    }
+
+    private static List<RouteNodeSnapshot> SelectBalancedNodes(List<RouteNodeSnapshot> candidates, List<ItemSnapshot> activeItems, int limit)
+    {
+        if (candidates.Count <= limit) return candidates.ToList();
+        var selected = new List<RouteNodeSnapshot>();
+        while (selected.Count < limit)
+        {
+            var added = false;
+            foreach (var item in activeItems)
+            {
+                var next = candidates.Where(x => !selected.Contains(x) && x.ItemIds.Contains(item.Id))
+                    .OrderBy(x => selected.Count == 0 ? 0 : selected.Min(y => Vector3.Distance(x.Position, y.Position))).FirstOrDefault();
+                if (next == null) continue;
+                selected.Add(next); added = true;
+                if (selected.Count == limit) break;
+            }
+            if (!added) break;
+        }
+        return selected;
+    }
+
+    private static List<RouteNodeSnapshot> OptimizeCycle(List<RouteNodeSnapshot> nodes)
+    {
+        List<RouteNodeSnapshot>? best = null;
+        var bestLength = float.MaxValue;
+        foreach (var start in nodes)
+        {
+            var remaining = nodes.Where(x => x != start).ToList();
+            var route = new List<RouteNodeSnapshot> { start };
+            while (remaining.Count > 0)
+            {
+                var next = remaining.OrderBy(x => Vector3.Distance(route[^1].Position, x.Position)).First();
+                route.Add(next); remaining.Remove(next);
+            }
+            ImproveCycle(route);
+            var length = CycleLength(route);
+            if (length < bestLength) { best = route; bestLength = length; }
+        }
+        return best ?? nodes;
+    }
+
+    private static void ImproveCycle(List<RouteNodeSnapshot> route)
+    {
+        var improved = true;
+        while (improved)
+        {
+            improved = false;
+            for (var i = 1; i < route.Count - 1; i++)
+            for (var k = i + 1; k < route.Count; k++)
+            {
+                var a = route[(i - 1 + route.Count) % route.Count]; var b = route[i];
+                var c = route[k]; var d = route[(k + 1) % route.Count];
+                var current = Vector3.Distance(a.Position, b.Position) + Vector3.Distance(c.Position, d.Position);
+                var swapped = Vector3.Distance(a.Position, c.Position) + Vector3.Distance(b.Position, d.Position);
+                if (swapped + .1f >= current) continue;
+                route.Reverse(i, k - i + 1); improved = true;
+            }
         }
     }
+
+    private static float CycleLength(IReadOnlyList<RouteNodeSnapshot> route)
+    {
+        if (route.Count < 2) return 0;
+        var result = 0f;
+        for (var i = 0; i < route.Count; i++)
+            result += Vector3.Distance(route[i].Position, route[(i + 1) % route.Count].Position);
+        return result;
+    }
+
+    private static (uint ObjectId, int X, int Y, int Z) NodeKey(RouteNodeSnapshot node) =>
+        (node.ObjectId, (int)MathF.Round(node.Position.X * 2), (int)MathF.Round(node.Position.Y * 2), (int)MathF.Round(node.Position.Z * 2));
 
     private unsafe bool HandleExportTrip(VislandSnapshot data)
     {
@@ -338,7 +593,8 @@ public sealed class Plugin : IDalamudPlugin
         foreach (var entry in data->PerCategoryItems[0].AsSpan())
         {
             var item = entry.Value;
-            if (item == null || !config.Targets.TryGetValue((int)item->ItemId, out var keep) || keep is <= 0 or >= 999) continue;
+            if (item == null || !config.EnabledItems.Contains((int)item->ItemId)
+                || !config.Targets.TryGetValue((int)item->ItemId, out var keep) || keep is <= 0 or >= 999) continue;
             var count = (int)InventoryManager.Instance()->GetInventoryItemCount(item->ItemId);
             var quantity = count - keep;
             if (quantity <= 0) continue;
