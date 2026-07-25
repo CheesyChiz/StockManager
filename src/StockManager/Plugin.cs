@@ -20,6 +20,10 @@ public sealed class Plugin : IDalamudPlugin
 {
     private const string Command = "/stockmanager";
     private const string ShortCommand = "/sm";
+    private const string IslandMapTexturePath = "ui/map/h1m2/02/h1m202_m.tex";
+    private const float IslandMapSizeFactor = 1f;
+    private const float IslandMapOffsetX = -175f;
+    private const float IslandMapOffsetZ = 138f;
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly Services services;
     private readonly Configuration config;
@@ -58,7 +62,6 @@ public sealed class Plugin : IDalamudPlugin
     private DateTime nextMountRefresh = DateTime.MinValue;
     private readonly Dictionary<string, DateTime> blockedRoutes = new(StringComparer.OrdinalIgnoreCase);
     private string? mapRouteName;
-    private bool activeDivePathReset;
     private DateTime? activeDiveStartedAt;
 
     public Plugin(IDalamudPluginInterface pluginInterface)
@@ -339,6 +342,12 @@ public sealed class Plugin : IDalamudPlugin
 
     private bool QueueRouteStart(RouteSnapshot route, string? itemName, PendingRoutePurpose purpose)
     {
+        if (purpose == PendingRoutePurpose.Export && !adapter.TryDisableBuiltInAutoExport(out var autoExportError))
+        {
+            status = $"Could not disable Visland Auto Export before opening the exporter: {autoExportError}";
+            return false;
+        }
+
         var player = services.Objects.LocalPlayer;
         if (player == null || route.Waypoints.Count == 0)
         {
@@ -407,12 +416,16 @@ public sealed class Plugin : IDalamudPlugin
 
         var waypoint = pending.Route.Waypoints[pending.StartIndex];
         var distance = Vector3.Distance(player.Position, waypoint.Position);
+        var horizontalDistance = Vector2.Distance(
+            new Vector2(player.Position.X, player.Position.Z),
+            new Vector2(waypoint.Position.X, waypoint.Position.Z));
         var swimming = services.Condition[ConditionFlag.Swimming];
         var diving = services.Condition[ConditionFlag.Diving];
         var inWater = swimming || diving;
         var underwaterDestination = RouteAccessibility.IsUnderwater(waypoint.Position);
+        var progressDistance = underwaterDestination && swimming && !diving ? horizontalDistance : distance;
         var arrivalRadius = Math.Max(5f, waypoint.Radius + 2f);
-        if (distance <= arrivalRadius && (!underwaterDestination || !swimming || diving))
+        if (distance <= arrivalRadius && (!underwaterDestination || diving))
         {
             StartPreparedRoute(pending);
             return;
@@ -420,42 +433,38 @@ public sealed class Plugin : IDalamudPlugin
 
         if (underwaterDestination && swimming && !diving)
         {
-            pending.NavigationRequested = false;
-            pending.LastProgressDistance = distance;
             pending.DiveStartedAt ??= DateTime.UtcNow;
-            adapter.StopNavigation();
-            status = $"Diving before continuing underwater to {pending.Route.Name}...";
+            status = $"Swimming to a diveable point and diving for {pending.Route.Name}...";
             if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
-            if (config.SkipStuckRoutes
-                && DateTime.UtcNow - pending.DiveStartedAt.Value > TimeSpan.FromSeconds(Math.Clamp(config.StuckTimeoutSeconds, 8, 60)))
-            {
-                HandleStuckRoute(pending, "the character could not dive");
-                return;
-            }
             TryDive();
-            return;
         }
-        pending.DiveStartedAt = null;
+        else if (!diving) pending.DiveStartedAt = null;
 
         if (diving && pending.NavigationRequested && !pending.NavigationWasThreeDimensional)
         {
             adapter.StopNavigation();
             pending.NavigationRequested = false;
             pending.LastProgressAt = DateTime.UtcNow;
+            pending.LastProgressDistance = distance;
             status = $"Rebuilding a three-dimensional underwater path to {pending.Route.Name}...";
             if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
             return;
         }
 
-        var requiresMount = distance > 12f || waypoint.Movement != RouteMovement.Normal;
+        var requiresMount = diving || distance > 12f || waypoint.Movement != RouteMovement.Normal;
         if (requiresMount && !services.Condition[ConditionFlag.Mounted] && (!inWater || diving))
         {
             pending.NavigationRequested = false;
-            pending.LastProgressAt = DateTime.UtcNow;
-            pending.LastProgressDistance = distance;
+            pending.MountStartedAt ??= DateTime.UtcNow;
             adapter.StopNavigation();
             status = $"Mounting before travelling directly to {pending.Route.Name}...";
             if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            if (config.SkipStuckRoutes
+                && DateTime.UtcNow - pending.MountStartedAt.Value > TimeSpan.FromSeconds(Math.Max(20, Math.Clamp(config.StuckTimeoutSeconds, 8, 60))))
+            {
+                HandleStuckRoute(pending, diving ? "the character could not mount underwater" : "the character could not mount");
+                return;
+            }
             if (!services.Condition[ConditionFlag.Casting]
                 && !services.Condition[ConditionFlag.Mounting]
                 && !services.Condition[ConditionFlag.MountOrOrnamentTransition]
@@ -466,6 +475,12 @@ public sealed class Plugin : IDalamudPlugin
             }
             return;
         }
+        if (pending.MountStartedAt != null)
+        {
+            pending.LastProgressAt = DateTime.UtcNow;
+            pending.LastProgressDistance = progressDistance;
+        }
+        pending.MountStartedAt = null;
 
         if (!pending.NavigationRequested)
         {
@@ -473,7 +488,10 @@ public sealed class Plugin : IDalamudPlugin
                                    || (waypoint.Movement == RouteMovement.MountFly
                                        && data.FlightUnlocked == true
                                        && services.Condition[ConditionFlag.Mounted]);
-            if (!adapter.TryNavigateTo(waypoint.Position, threeDimensional, out var error))
+            var navigationTarget = underwaterDestination && swimming && !diving
+                ? new Vector3(waypoint.Position.X, player.Position.Y, waypoint.Position.Z)
+                : waypoint.Position;
+            if (!adapter.TryNavigateTo(navigationTarget, threeDimensional, out var error))
             {
                 pendingRouteStart = null;
                 activeRoute = null;
@@ -485,13 +503,11 @@ public sealed class Plugin : IDalamudPlugin
             pending.NavigationRequested = true;
             pending.NavigationWasThreeDimensional = threeDimensional;
             navigationRequestedAt = DateTime.UtcNow;
-            pending.LastProgressAt = DateTime.UtcNow;
-            pending.LastProgressDistance = distance;
         }
 
-        if (distance + 1.5f < pending.LastProgressDistance)
+        if (progressDistance + 1.5f < pending.LastProgressDistance)
         {
-            pending.LastProgressDistance = distance;
+            pending.LastProgressDistance = progressDistance;
             pending.LastProgressAt = DateTime.UtcNow;
         }
         else if (config.SkipStuckRoutes
@@ -501,14 +517,15 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
-        status = $"Navigating directly with vnavmesh to {pending.Route.Name}... ({distance:F0} yalms)";
+        status = underwaterDestination && swimming && !diving
+            ? $"Swimming and looking for a dive point for {pending.Route.Name}... ({horizontalDistance:F0} yalms)"
+            : $"Navigating directly with vnavmesh to {pending.Route.Name}... ({distance:F0} yalms)";
         if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
         if (DateTime.UtcNow - navigationRequestedAt < TimeSpan.FromSeconds(2) || adapter.IsNavigationBusy) return;
 
         if (inWater)
         {
             pending.NavigationRequested = false;
-            pending.LastProgressAt = DateTime.UtcNow;
             status = $"Repathing through water to {pending.Route.Name}...";
             if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
             return;
@@ -594,14 +611,16 @@ public sealed class Plugin : IDalamudPlugin
 
     private unsafe void TryDive()
     {
-        if (!services.Condition[ConditionFlag.Swimming] || services.Condition[ConditionFlag.Diving]
+        if ((!services.Condition[ConditionFlag.Swimming] && !services.Condition[ConditionFlag.Mounted])
+            || services.Condition[ConditionFlag.Diving]
             || DateTime.UtcNow < nextDiveAttempt) return;
-        nextDiveAttempt = DateTime.UtcNow.AddSeconds(1.5);
+        nextDiveAttempt = DateTime.UtcNow.AddSeconds(2);
         try
         {
             dive ??= Marshal.GetDelegateForFunctionPointer<DiveDelegate>(services.SigScanner.ScanText(
                 "48 89 5C 24 ?? 57 48 81 EC ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 ?? ?? ?? ?? 48 8B 1D ?? ?? ?? ?? 48 8D 54 24"));
             dive(Control.Instance());
+            ActionManager.Instance()->UseAction(ActionType.GeneralAction, 23);
         }
         catch (Exception exception)
         {
@@ -615,20 +634,14 @@ public sealed class Plugin : IDalamudPlugin
                     ?? (string.Equals(experimentalRoute?.Name, activeRoute, StringComparison.OrdinalIgnoreCase) ? experimentalRoute : null);
         if (route == null || !route.Waypoints.Any(x => RouteAccessibility.IsUnderwater(x.Position)))
         {
-            activeDivePathReset = false;
             activeDiveStartedAt = null;
             return;
         }
         if (services.Condition[ConditionFlag.Diving])
         {
             activeDiveStartedAt = null;
-            if (activeDivePathReset) return;
-            adapter.StopNavigation();
-            activeDivePathReset = true;
-            status = $"Rebuilding a three-dimensional underwater path for {route.Name}...";
             return;
         }
-        activeDivePathReset = false;
         if (!services.Condition[ConditionFlag.Swimming])
         {
             activeDiveStartedAt = null;
@@ -636,7 +649,7 @@ public sealed class Plugin : IDalamudPlugin
         }
         activeDiveStartedAt ??= DateTime.UtcNow;
         if (config.SkipStuckRoutes
-            && DateTime.UtcNow - activeDiveStartedAt.Value > TimeSpan.FromSeconds(Math.Clamp(config.StuckTimeoutSeconds, 8, 60)))
+            && DateTime.UtcNow - activeDiveStartedAt.Value > TimeSpan.FromSeconds(Math.Max(30, Math.Clamp(config.StuckTimeoutSeconds, 8, 60))))
         {
             adapter.Stop();
             blockedRoutes[route.Name] = DateTime.UtcNow.AddMinutes(5);
@@ -994,34 +1007,40 @@ public sealed class Plugin : IDalamudPlugin
         var resources = string.Join(", ", route.Items.Select(x => x.Name));
         ImGui.TextWrapped($"{route.Waypoints.Count} waypoints  |  {(route.RequiresFlying ? "flight required" : "ground/underwater compatible")}"
                           + (string.IsNullOrWhiteSpace(resources) ? string.Empty : $"  |  {resources}"));
-        ImGui.TextDisabled("Initial Island-coordinate preview. Hover a point for coordinates and movement details.");
+        ImGui.TextDisabled("Island map texture with game-coordinate route overlay. Hover the map or a waypoint for coordinates.");
 
         var available = ImGui.GetContentRegionAvail();
-        var canvasSize = new Vector2(Math.Max(320, available.X), Math.Max(360, available.Y));
+        var side = Math.Clamp(Math.Min(available.X, available.Y), 240f, 900f);
+        var canvasSize = new Vector2(side, side);
+        if (available.X > side) ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (available.X - side) * .5f);
         ImGui.InvisibleButton("##RouteMapCanvas", canvasSize);
         var topLeft = ImGui.GetItemRectMin();
         var bottomRight = ImGui.GetItemRectMax();
         var draw = ImGui.GetWindowDrawList();
         var background = ImGui.ColorConvertFloat4ToU32(new Vector4(.035f, .055f, .06f, .96f));
-        var border = ImGui.ColorConvertFloat4ToU32(new Vector4(.32f, .38f, .4f, 1));
-        var grid = ImGui.ColorConvertFloat4ToU32(new Vector4(.2f, .28f, .29f, .55f));
+        var border = ImGui.ColorConvertFloat4ToU32(new Vector4(.65f, .7f, .7f, 1));
+        var grid = ImGui.ColorConvertFloat4ToU32(new Vector4(.75f, .82f, .8f, .22f));
         draw.AddRectFilled(topLeft, bottomRight, background);
+        var mapTexture = services.Textures.GetFromGame(IslandMapTexturePath).GetWrapOrEmpty();
+        if (mapTexture != null) draw.AddImage(mapTexture.Handle, topLeft, bottomRight);
         draw.AddRect(topLeft, bottomRight, border);
 
-        const float minX = -900f, maxX = 900f, minZ = -700f, maxZ = 700f;
+        // FFXIV map rows are centered on pixel 1024 of a 2048px texture. Island Sanctuary is map h1m2/02,
+        // SizeFactor 100 with offsets (-175, 138), so route positions can be placed without hand-tuned bounds.
         Vector2 ToCanvas(Vector3 world) => new(
-            topLeft.X + (world.X - minX) / (maxX - minX) * canvasSize.X,
-            topLeft.Y + (world.Z - minZ) / (maxZ - minZ) * canvasSize.Y);
+            topLeft.X + canvasSize.X * .5f + (world.X + IslandMapOffsetX) * IslandMapSizeFactor * canvasSize.X / 2048f,
+            topLeft.Y + canvasSize.Y * .5f + (world.Z + IslandMapOffsetZ) * IslandMapSizeFactor * canvasSize.Y / 2048f);
+        draw.PushClipRect(topLeft, bottomRight, true);
         for (var x = -800; x <= 800; x += 200)
         {
-            var a = ToCanvas(new Vector3(x, 0, minZ));
-            var b = ToCanvas(new Vector3(x, 0, maxZ));
+            var a = ToCanvas(new Vector3(x, 0, -1100));
+            var b = ToCanvas(new Vector3(x, 0, 1100));
             draw.AddLine(a, b, grid);
         }
-        for (var z = -600; z <= 600; z += 200)
+        for (var z = -800; z <= 800; z += 200)
         {
-            var a = ToCanvas(new Vector3(minX, 0, z));
-            var b = ToCanvas(new Vector3(maxX, 0, z));
+            var a = ToCanvas(new Vector3(-1100, 0, z));
+            var b = ToCanvas(new Vector3(1100, 0, z));
             draw.AddLine(a, b, grid);
         }
 
@@ -1062,16 +1081,25 @@ public sealed class Plugin : IDalamudPlugin
         {
             var playerColor = ImGui.ColorConvertFloat4ToU32(new Vector4(1f, .95f, .2f, 1));
             draw.AddCircleFilled(ToCanvas(player.Position), 6f, playerColor);
+            draw.AddCircle(ToCanvas(player.Position), 8f, 0xFF000000, 0, 2f);
         }
-        draw.AddText(topLeft + new Vector2(8, 7), border, "N");
+        draw.AddText(topLeft + new Vector2(8, 7), 0xFFFFFFFF, "N");
+        draw.PopClipRect();
 
-        if (hovered != null && ImGui.IsItemHovered())
+        if (ImGui.IsItemHovered())
         {
+            var worldAtMouse = new Vector2(
+                (mouse.X - topLeft.X - canvasSize.X * .5f) * 2048f / canvasSize.X / IslandMapSizeFactor - IslandMapOffsetX,
+                (mouse.Y - topLeft.Y - canvasSize.Y * .5f) * 2048f / canvasSize.Y / IslandMapSizeFactor - IslandMapOffsetZ);
             ImGui.BeginTooltip();
-            ImGui.TextUnformatted($"Waypoint #{hoveredIndex + 1}");
-            ImGui.TextUnformatted($"X {hovered.Position.X:F1}  Y {hovered.Position.Y:F1}  Z {hovered.Position.Z:F1}");
-            ImGui.TextUnformatted(RouteAccessibility.IsUnderwater(hovered.Position) ? "Underwater" : hovered.Movement.ToString());
-            if (!string.IsNullOrWhiteSpace(hovered.ObjectName)) ImGui.TextUnformatted(hovered.ObjectName);
+            if (hovered != null)
+            {
+                ImGui.TextUnformatted($"Waypoint #{hoveredIndex + 1}");
+                ImGui.TextUnformatted($"X {hovered.Position.X:F1}  Y {hovered.Position.Y:F1}  Z {hovered.Position.Z:F1}");
+                ImGui.TextUnformatted(RouteAccessibility.IsUnderwater(hovered.Position) ? "Underwater" : hovered.Movement.ToString());
+                if (!string.IsNullOrWhiteSpace(hovered.ObjectName)) ImGui.TextUnformatted(hovered.ObjectName);
+            }
+            else ImGui.TextUnformatted($"X {worldAtMouse.X:F1}  Z {worldAtMouse.Y:F1}");
             ImGui.EndTooltip();
         }
     }
@@ -1315,6 +1343,9 @@ public sealed class Plugin : IDalamudPlugin
         if (!adapter.IsLifestreamAvailable) ImGui.EndDisabled();
         if (!adapter.IsLifestreamAvailable) ImGui.TextDisabled("Optional: install Lifestream to enable Island travel.");
         if (config.CompletionAction != CompletionAction.FarmAndExport) return;
+        if (snapshot?.AutoExportEnabled == true)
+            ImGui.TextColored(new Vector4(1f, .7f, .25f, 1), "Visland Auto Export is on; Stock Manager will disable it before opening the exporter.");
+        else ImGui.TextDisabled("Visland Auto Export is off; Stock Manager uses the individual Sell above values below.");
     }
 
     private void NormalizeExportLimits()
@@ -1538,6 +1569,16 @@ public sealed class Plugin : IDalamudPlugin
 
     private unsafe bool HandleExportTrip(VislandSnapshot data)
     {
+        if (data.AutoExportEnabled)
+        {
+            if (!adapter.TryDisableBuiltInAutoExport(out var autoExportError))
+            {
+                status = $"Waiting to take over Visland Auto Export: {autoExportError}";
+                return true;
+            }
+            status = "Visland Auto Export disabled; continuing to the exporter.";
+            return true;
+        }
         if (data.IsRunning) { status = "Going to the Island exporter..."; return true; }
         var select = (AtkUnitBase*)services.GameGui.GetAddonByName("SelectString").Address;
         if (select != null && select->IsVisible && select->IsReady)
@@ -1628,6 +1669,7 @@ public sealed class Plugin : IDalamudPlugin
         public float LastProgressDistance { get; set; } = float.MaxValue;
         public DateTime LastProgressAt { get; set; } = DateTime.UtcNow;
         public DateTime? DiveStartedAt { get; set; }
+        public DateTime? MountStartedAt { get; set; }
     }
 
     private sealed record MountOption(uint Id, string Name);
@@ -1641,6 +1683,7 @@ public sealed class Plugin : IDalamudPlugin
         [PluginService] internal IClientState ClientState { get; private init; } = null!;
         [PluginService] internal ICondition Condition { get; private init; } = null!;
         [PluginService] internal IDataManager Data { get; private init; } = null!;
+        [PluginService] internal ITextureProvider Textures { get; private init; } = null!;
         [PluginService] internal IObjectTable Objects { get; private init; } = null!;
         [PluginService] internal IGameGui GameGui { get; private init; } = null!;
         [PluginService] internal IChatGui ChatGui { get; private init; } = null!;
