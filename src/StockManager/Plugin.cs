@@ -10,6 +10,7 @@ using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Component.GUI;
+using GameObject = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject;
 using MountSheet = Lumina.Excel.Sheets.Mount;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -24,6 +25,8 @@ public sealed class Plugin : IDalamudPlugin
     private const float IslandMapSizeFactor = 1f;
     private const float IslandMapOffsetX = -175f;
     private const float IslandMapOffsetZ = 138f;
+    private const uint ExporterObjectId = 1043464;
+    private static readonly Vector3 IslandBaseExterior = new(-268f, 40f, 226f);
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly Services services;
     private readonly Configuration config;
@@ -39,9 +42,15 @@ public sealed class Plugin : IDalamudPlugin
     private bool exportTrip;
     private bool exportSubmitted;
     private bool travelRequested;
+    private bool leavingExporter;
+    private bool exporterExitNavigationRequested;
     private bool experimentalTestRunning;
     private string status = "Waiting for Visland...";
     private string? activeRoute;
+    private string? lastFarmRoute;
+    private int? activeTargetItemId;
+    private string? activeTargetItemName;
+    private int? activeTargetGoal;
     private PendingRouteStart? pendingRouteStart;
     private DateTime navigationStartedAt;
     private DateTime navigationRequestedAt;
@@ -62,7 +71,19 @@ public sealed class Plugin : IDalamudPlugin
     private DateTime nextMountRefresh = DateTime.MinValue;
     private readonly Dictionary<string, DateTime> blockedRoutes = new(StringComparer.OrdinalIgnoreCase);
     private string? mapRouteName;
+    private MapDisplayMode mapDisplayMode;
+    private int? mapResourceId;
+    private float mapZoom = 1f;
+    private Vector2 mapPan;
     private DateTime? activeDiveStartedAt;
+    private DateTime nextExporterInteractionAttempt = DateTime.MinValue;
+    private DateTime nextIsleReturnAttempt = DateTime.MinValue;
+    private DateTime exporterExitStartedAt = DateTime.MinValue;
+    private DateTime exporterExitLastProgressAt = DateTime.MinValue;
+    private float exporterExitLastDistance = float.MaxValue;
+    private Vector3? activeLastPosition;
+    private int activeLastInventoryTotal;
+    private DateTime activeLastProgressAt = DateTime.MinValue;
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
@@ -237,12 +258,28 @@ public sealed class Plugin : IDalamudPlugin
             config.Enabled = false; adapter.Stop(); EndSession(); Save(); status = validationError; return;
         }
         if (exportTrip && HandleExportTrip(snapshot)) return;
-        if (snapshot.IsRunning)
+        if (leavingExporter)
         {
-            status = activeRoute == null ? "Visland is running a route" : $"Running: {activeRoute}";
-            HandleActiveRouteWater(snapshot);
+            HandleExporterExit(snapshot);
             return;
         }
+        if (snapshot.IsRunning)
+        {
+            if (HandleActiveFarmTarget(snapshot)) return;
+            var trackedItem = activeTargetItemId == null
+                ? null
+                : UniqueItems(snapshot).FirstOrDefault(x => x.Id == activeTargetItemId.Value);
+            status = activeRoute == null
+                ? "Visland is running a route"
+                : activeTargetItemName == null
+                    ? $"Running: {activeRoute}"
+                    : $"Running: {activeRoute} for {activeTargetItemName}"
+                      + (trackedItem != null && activeTargetGoal.HasValue ? $" ({trackedItem.CurrentCount}/{activeTargetGoal.Value})" : string.Empty);
+            HandleActiveRouteWater(snapshot);
+            HandleActiveRouteStuck(snapshot);
+            return;
+        }
+        ClearActiveTargetTracking();
         if (DateTime.UtcNow < nextStartAttempt) return;
 
         if (config.CompletionAction == CompletionAction.FarmAndExport)
@@ -261,13 +298,14 @@ public sealed class Plugin : IDalamudPlugin
                 .OrderByDescending(x => x.CurrentCount - ExportTrigger(x.Id)).FirstOrDefault();
             if (exportDue != null)
             {
-                QueueRouteStart(adapter.CreateExportTripRoute(), exportDue.Name, PendingRoutePurpose.Export);
+                QueueRouteStart(adapter.CreateExportTripRoute(), exportDue, PendingRoutePurpose.Export);
                 nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
                 return;
             }
         }
 
         var choice = SelectNextRoute(snapshot);
+        var targetGoal = choice == null ? 0 : config.Targets[choice.Value.Item.Id];
         if (choice == null)
         {
             if (ManagedItems(snapshot).Any(x => x.IsAvailable && x.CurrentCount < config.Targets[x.Id]))
@@ -285,9 +323,10 @@ public sealed class Plugin : IDalamudPlugin
             var cowrieRoute = SelectCowrieRoute(snapshot);
             if (cowrieRoute == null) { status = "No compatible unlocked resource routes are enabled."; return; }
             choice = cowrieRoute;
+            targetGoal = ExportTrigger(choice.Value.Item.Id);
         }
 
-        QueueRouteStart(choice.Value.Route, choice.Value.Item.Name, PendingRoutePurpose.Farm);
+        QueueRouteStart(choice.Value.Route, choice.Value.Item, PendingRoutePurpose.Farm, targetGoal);
         nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
     }
 
@@ -311,8 +350,11 @@ public sealed class Plugin : IDalamudPlugin
 
         config.Enabled = true;
         exportTrip = false;
+        leavingExporter = false;
+        exporterExitNavigationRequested = false;
         travelRequested = false;
         activeRoute = null;
+        ClearActiveTargetTracking();
         pendingRouteStart = null;
         experimentalTestRunning = false;
         nextStartAttempt = DateTime.MinValue;
@@ -328,11 +370,14 @@ public sealed class Plugin : IDalamudPlugin
         var wasTravelRequested = travelRequested;
         config.Enabled = false;
         exportTrip = false;
+        leavingExporter = false;
+        exporterExitNavigationRequested = false;
         exportSubmitted = false;
         travelRequested = false;
         pendingRouteStart = null;
         experimentalTestRunning = false;
         activeRoute = null;
+        ClearActiveTargetTracking();
         adapter.Stop();
         if (emergency || wasTravelRequested) adapter.AbortLifestream();
         EndSession();
@@ -340,7 +385,7 @@ public sealed class Plugin : IDalamudPlugin
         status = message;
     }
 
-    private bool QueueRouteStart(RouteSnapshot route, string? itemName, PendingRoutePurpose purpose)
+    private bool QueueRouteStart(RouteSnapshot route, ItemSnapshot? item, PendingRoutePurpose purpose, int? itemGoal = null)
     {
         if (purpose == PendingRoutePurpose.Export && !adapter.TryDisableBuiltInAutoExport(out var autoExportError))
         {
@@ -365,17 +410,18 @@ public sealed class Plugin : IDalamudPlugin
         var nearest = route.Waypoints.Select((waypoint, index) => (Waypoint: waypoint, Index: index,
                 Distance: Vector3.Distance(player.Position, waypoint.Position)))
             .OrderBy(x => x.Distance).First();
-        var startIndex = nearest.Distance <= 35f ? nearest.Index : 0;
-        pendingRouteStart = new PendingRouteStart(route, itemName, purpose, startIndex);
+        var startIndex = purpose == PendingRoutePurpose.Export ? 0 : nearest.Distance <= 35f ? nearest.Index : 0;
+        pendingRouteStart = new PendingRouteStart(route, item?.Id, item?.Name, itemGoal, purpose, startIndex);
         navigationStartedAt = DateTime.UtcNow;
         navigationRequestedAt = DateTime.MinValue;
         nextMountAttempt = DateTime.MinValue;
         nextDiveAttempt = DateTime.MinValue;
         activeRoute = route.Name;
         var startDistance = Vector3.Distance(player.Position, route.Waypoints[startIndex].Position);
+        pendingRouteStart.UseIsleReturn = purpose == PendingRoutePurpose.Export && startDistance > 35f;
         pendingRouteStart.LastProgressDistance = startDistance;
         pendingRouteStart.LastProgressAt = DateTime.UtcNow;
-        status = nearest.Distance <= 35f
+        status = purpose != PendingRoutePurpose.Export && nearest.Distance <= 35f
             ? $"Starting {route.Name} from nearby waypoint #{startIndex + 1}..."
             : $"Preparing a direct vnavmesh route to {route.Name}...";
         if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
@@ -412,6 +458,38 @@ public sealed class Plugin : IDalamudPlugin
         {
             status = "Waiting for the current Visland route to finish before navigating...";
             return;
+        }
+
+        if (pending.Purpose == PendingRoutePurpose.Export && pending.UseIsleReturn)
+        {
+            var baseDistance = Vector3.Distance(player.Position, IslandBaseExterior);
+            if (baseDistance <= 12f)
+            {
+                pending.UseIsleReturn = false;
+                pending.LastProgressDistance = baseDistance;
+                pending.LastProgressAt = DateTime.UtcNow;
+            }
+            else if (pending.IsleReturnStartedAt == null
+                     || DateTime.UtcNow - pending.IsleReturnStartedAt.Value <= TimeSpan.FromSeconds(15))
+            {
+                pending.IsleReturnStartedAt ??= DateTime.UtcNow;
+                if (!services.Condition[ConditionFlag.Casting]
+                    && !services.Condition[ConditionFlag.OccupiedInEvent]
+                    && DateTime.UtcNow >= nextIsleReturnAttempt)
+                {
+                    TryUseIsleReturn();
+                    nextIsleReturnAttempt = DateTime.UtcNow.AddSeconds(2);
+                }
+                status = "Using Isle Return before visiting the Island exporter...";
+                return;
+            }
+            else
+            {
+                pending.UseIsleReturn = false;
+                pending.LastProgressAt = DateTime.UtcNow;
+                pending.LastProgressDistance = baseDistance;
+                status = "Isle Return was unavailable; falling back to vnavmesh.";
+            }
         }
 
         var waypoint = pending.Route.Waypoints[pending.StartIndex];
@@ -451,6 +529,43 @@ public sealed class Plugin : IDalamudPlugin
             return;
         }
 
+        if (pending.ExitingCabin)
+        {
+            var exitDistance = Vector3.Distance(player.Position, IslandBaseExterior);
+            if (exitDistance <= 6f)
+            {
+                adapter.StopNavigation();
+                pending.ExitingCabin = false;
+                pending.NavigationRequested = false;
+                pending.LastProgressAt = DateTime.UtcNow;
+                pending.LastProgressDistance = distance;
+                status = $"Outside the cabin; preparing to mount for {pending.Route.Name}...";
+                return;
+            }
+            if (!pending.NavigationRequested || !adapter.IsNavigationBusy)
+            {
+                if (!adapter.TryNavigateTo(IslandBaseExterior, false, out var exitError))
+                {
+                    HandleStuckRoute(pending, $"the cabin exit could not be reached: {exitError}");
+                    return;
+                }
+                pending.NavigationRequested = true;
+            }
+            if (exitDistance + 1f < pending.LastProgressDistance)
+            {
+                pending.LastProgressDistance = exitDistance;
+                pending.LastProgressAt = DateTime.UtcNow;
+            }
+            else if (config.SkipStuckRoutes
+                     && DateTime.UtcNow - pending.LastProgressAt > TimeSpan.FromSeconds(Math.Clamp(config.StuckTimeoutSeconds, 8, 60)))
+            {
+                TryUseIsleReturn();
+                pending.LastProgressAt = DateTime.UtcNow;
+            }
+            status = $"Mounts are unavailable in the cabin; walking outside first... ({exitDistance:F0} yalms)";
+            return;
+        }
+
         var requiresMount = diving || distance > 12f || waypoint.Movement != RouteMovement.Normal;
         if (requiresMount && !services.Condition[ConditionFlag.Mounted] && (!inWater || diving))
         {
@@ -459,6 +574,19 @@ public sealed class Plugin : IDalamudPlugin
             adapter.StopNavigation();
             status = $"Mounting before travelling directly to {pending.Route.Name}...";
             if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            if (!diving
+                && pending.MountStartedAt.HasValue
+                && DateTime.UtcNow - pending.MountStartedAt.Value > TimeSpan.FromSeconds(3)
+                && Vector3.Distance(player.Position, IslandBaseExterior) < 35f)
+            {
+                pending.ExitingCabin = true;
+                pending.MountStartedAt = null;
+                pending.NavigationRequested = false;
+                pending.LastProgressDistance = Vector3.Distance(player.Position, IslandBaseExterior);
+                pending.LastProgressAt = DateTime.UtcNow;
+                status = "Mount unavailable near the cabin; walking to the exterior first...";
+                return;
+            }
             if (config.SkipStuckRoutes
                 && DateTime.UtcNow - pending.MountStartedAt.Value > TimeSpan.FromSeconds(Math.Max(20, Math.Clamp(config.StuckTimeoutSeconds, 8, 60))))
             {
@@ -541,6 +669,7 @@ public sealed class Plugin : IDalamudPlugin
         if (!adapter.TryStartRoute(pending.Route, pending.StartIndex, snapshot?.FlightUnlocked == true, out var error))
         {
             activeRoute = null;
+            ClearActiveTargetTracking();
             status = $"Visland rejected start: {error}";
             if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
             nextStartAttempt = DateTime.UtcNow.AddSeconds(5);
@@ -550,21 +679,90 @@ public sealed class Plugin : IDalamudPlugin
         switch (pending.Purpose)
         {
             case PendingRoutePurpose.Export:
+                ClearActiveTargetTracking();
                 exportTrip = true;
                 exportSubmitted = false;
                 exportTripStarted = DateTime.UtcNow;
+                nextExporterInteractionAttempt = DateTime.MinValue;
                 closeExportAfter = DateTime.MaxValue;
                 status = $"{pending.ItemName} reached its export threshold; going to export configured surplus.";
                 break;
             case PendingRoutePurpose.Experimental:
+                ClearActiveTargetTracking();
                 experimentalTestRunning = true;
-                status = "Experimental test loop started in Visland. Use Emergency stop if needed.";
+                status = "Experimental test loop started in Visland. Use Stop test loop or Emergency stop if needed.";
                 experimentalStatus = status;
                 break;
             default:
-                status = $"Starting {pending.Route.Name} for {pending.ItemName}.";
+                activeTargetItemId = pending.ItemId;
+                activeTargetItemName = pending.ItemName;
+                activeTargetGoal = pending.ItemGoal;
+                lastFarmRoute = pending.Route.Name;
+                activeLastPosition = services.Objects.LocalPlayer?.Position;
+                activeLastInventoryTotal = snapshot == null ? 0 : UniqueItems(snapshot).Sum(x => x.CurrentCount);
+                activeLastProgressAt = DateTime.UtcNow;
+                status = $"Starting {pending.Route.Name} for {pending.ItemName}"
+                         + (pending.ItemGoal.HasValue ? $" ({pending.ItemGoal.Value} target)." : ".");
                 break;
         }
+    }
+
+    private bool HandleActiveFarmTarget(VislandSnapshot data)
+    {
+        if (activeTargetItemId == null || activeTargetGoal == null) return false;
+        var item = UniqueItems(data).FirstOrDefault(x => x.Id == activeTargetItemId.Value);
+        if (item == null) return false;
+        if (item.CurrentCount < activeTargetGoal.Value)
+        {
+            status = $"Running: {activeRoute} for {item.Name} ({item.CurrentCount}/{activeTargetGoal.Value})";
+            return false;
+        }
+
+        var routeName = activeRoute;
+        var reachedGoal = activeTargetGoal.Value;
+        adapter.Stop();
+        activeRoute = null;
+        ClearActiveTargetTracking();
+        nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
+        status = $"{item.Name} reached {reachedGoal}; stopped {routeName} and recalculating.";
+        return true;
+    }
+
+    private void HandleActiveRouteStuck(VislandSnapshot data)
+    {
+        if (!config.SkipStuckRoutes || activeRoute == null || exportTrip || activeDiveStartedAt != null) return;
+        var player = services.Objects.LocalPlayer;
+        if (player == null) return;
+        var inventoryTotal = UniqueItems(data).Sum(x => x.CurrentCount);
+        if (activeLastPosition == null
+            || Vector3.Distance(activeLastPosition.Value, player.Position) >= 1.5f
+            || inventoryTotal != activeLastInventoryTotal)
+        {
+            activeLastPosition = player.Position;
+            activeLastInventoryTotal = inventoryTotal;
+            activeLastProgressAt = DateTime.UtcNow;
+            return;
+        }
+
+        if (DateTime.UtcNow - activeLastProgressAt <= TimeSpan.FromSeconds(Math.Clamp(config.StuckTimeoutSeconds, 8, 60))) return;
+
+        var routeName = activeRoute;
+        adapter.Stop();
+        blockedRoutes[routeName] = DateTime.UtcNow.AddMinutes(5);
+        activeRoute = null;
+        ClearActiveTargetTracking();
+        nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
+        status = $"Skipped {routeName}: no movement or gathering progress was detected. Cooling it down for 5 minutes.";
+    }
+
+    private void ClearActiveTargetTracking()
+    {
+        activeTargetItemId = null;
+        activeTargetItemName = null;
+        activeTargetGoal = null;
+        activeLastPosition = null;
+        activeLastInventoryTotal = 0;
+        activeLastProgressAt = DateTime.MinValue;
     }
 
     private unsafe void TryUseConfiguredMount()
@@ -577,6 +775,12 @@ public sealed class Plugin : IDalamudPlugin
             if (actions->UseAction(ActionType.Mount, config.MountId)) return;
         }
         actions->UseAction(ActionType.GeneralAction, 24);
+    }
+
+    private static unsafe void TryUseIsleReturn()
+    {
+        var actions = ActionManager.Instance();
+        if (actions != null) actions->UseAction(ActionType.GeneralAction, 27);
     }
 
     private unsafe void InitializeMountOverride()
@@ -654,6 +858,7 @@ public sealed class Plugin : IDalamudPlugin
             adapter.Stop();
             blockedRoutes[route.Name] = DateTime.UtcNow.AddMinutes(5);
             activeRoute = null;
+            ClearActiveTargetTracking();
             activeDiveStartedAt = null;
             nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
             status = $"Skipping {route.Name}: the character could not dive. Trying another route.";
@@ -668,6 +873,7 @@ public sealed class Plugin : IDalamudPlugin
         adapter.StopNavigation();
         pendingRouteStart = null;
         activeRoute = null;
+        ClearActiveTargetTracking();
         if (pending.Purpose == PendingRoutePurpose.Farm)
         {
             blockedRoutes[pending.Route.Name] = DateTime.UtcNow.AddMinutes(5);
@@ -693,6 +899,7 @@ public sealed class Plugin : IDalamudPlugin
         pendingRouteStart = null;
         experimentalTestRunning = false;
         activeRoute = null;
+        ClearActiveTargetTracking();
         experimentalStatus = "Experimental test loop stopped.";
         status = experimentalStatus;
     }
@@ -812,8 +1019,11 @@ public sealed class Plugin : IDalamudPlugin
     private (RouteSnapshot Route, ItemSnapshot Item)? SelectNextRoute(VislandSnapshot data)
     {
         var routes = SelectableRoutes(data);
-        var items = OrderItems(data, ManagedItems(data).Where(x => x.IsAvailable)
-            .Where(x => config.Targets[x.Id] > x.CurrentCount), x => config.Targets[x.Id], routes);
+        var candidates = ManagedItems(data).Where(x => x.IsAvailable)
+            .Where(x => config.Targets[x.Id] > x.CurrentCount).ToList();
+        if (config.ResourcePriority == ResourcePriority.FastestRoute)
+            return SelectBestProgressRoute(routes, candidates, x => config.Targets[x.Id]);
+        var items = OrderItems(data, candidates, x => config.Targets[x.Id], routes);
         foreach (var item in items)
         {
             var route = routes
@@ -830,7 +1040,9 @@ public sealed class Plugin : IDalamudPlugin
         var routes = SelectableRoutes(data);
         var items = ManagedItems(data).Where(x => x.IsAvailable)
             .Where(x => config.Targets.TryGetValue(x.Id, out var target) && target is > 0 and < 999)
-            .Where(x => x.CurrentCount < ExportTrigger(x.Id));
+            .Where(x => x.CurrentCount < ExportTrigger(x.Id)).ToList();
+        if (config.ResourcePriority == ResourcePriority.FastestRoute)
+            return SelectBestProgressRoute(routes, items, x => ExportTrigger(x.Id));
         foreach (var item in OrderItems(data, items, x => ExportTrigger(x.Id), routes))
         {
             var route = routes.Select(x => (Route: x, Item: x.Items.FirstOrDefault(y => y.Id == item.Id)))
@@ -839,6 +1051,62 @@ public sealed class Plugin : IDalamudPlugin
             if (route.Item != null) return (route.Route, item);
         }
         return null;
+    }
+
+    private (RouteSnapshot Route, ItemSnapshot Item)? SelectBestProgressRoute(
+        IReadOnlyCollection<RouteSnapshot> routes, IReadOnlyCollection<ItemSnapshot> items, Func<ItemSnapshot, int> goal)
+    {
+        if (routes.Count == 0 || items.Count == 0) return null;
+        var byId = items.ToDictionary(x => x.Id);
+        var player = services.Objects.LocalPlayer;
+        var ranked = routes.Select(route =>
+        {
+            var useful = route.Items
+                .Where(x => byId.ContainsKey(x.Id))
+                .Select(x =>
+                {
+                    var item = byId[x.Id];
+                    var remaining = Math.Max(0, goal(item) - item.CurrentCount);
+                    return (Item: item, RouteItem: x, Remaining: remaining,
+                        UsefulNodes: Math.Min(x.PerLoop, remaining));
+                })
+                .Where(x => x.UsefulNodes > 0).ToList();
+            var usefulNodes = useful.Sum(x => x.UsefulNodes);
+            var coveredTypes = useful.Count;
+            var weightedNeed = useful.Sum(x => x.UsefulNodes * (double)x.Remaining / Math.Max(1, goal(x.Item)));
+            var totalGatherNodes = route.Items.Sum(x => x.PerLoop);
+            var wastedNodes = Math.Max(0, totalGatherNodes - usefulNodes);
+            var cycleDistance = RouteCycleDistance(route);
+            var approachDistance = player == null || route.Waypoints.Count == 0
+                ? 0
+                : route.Waypoints.Min(x => Vector3.Distance(player.Position, x.Position));
+            var travelCost = Math.Max(25, cycleDistance + approachDistance * 2 + route.Waypoints.Count * 6 + wastedNodes * 8);
+            var progress = usefulNodes + weightedNeed + Math.Max(0, coveredTypes - 1);
+            var score = progress / travelCost;
+            var finishItem = useful.OrderBy(x => (double)x.Remaining / Math.Max(1, x.RouteItem.PerLoop))
+                .ThenByDescending(x => x.UsefulNodes).Select(x => x.Item).FirstOrDefault();
+            return (Route: route, Item: finishItem, Score: score, UsefulNodes: usefulNodes,
+                CoveredTypes: coveredTypes, WastedNodes: wastedNodes);
+        }).Where(x => x.Item != null && x.UsefulNodes > 0)
+            .OrderByDescending(x => x.Score)
+            .ThenByDescending(x => x.UsefulNodes)
+            .ThenByDescending(x => x.CoveredTypes)
+            .ThenBy(x => x.WastedNodes)
+            .ToList();
+        if (ranked.Count == 0) return null;
+        var best = ranked[0];
+        var currentArea = ranked.FirstOrDefault(x => string.Equals(x.Route.Name, lastFarmRoute, StringComparison.OrdinalIgnoreCase));
+        if (currentArea.Item != null && currentArea.Score >= best.Score * .8) best = currentArea;
+        return (best.Route, best.Item!);
+    }
+
+    private static double RouteCycleDistance(RouteSnapshot route)
+    {
+        if (route.Waypoints.Count < 2) return 0;
+        double result = 0;
+        for (var i = 0; i < route.Waypoints.Count; i++)
+            result += Vector3.Distance(route.Waypoints[i].Position, route.Waypoints[(i + 1) % route.Waypoints.Count].Position);
+        return result;
     }
 
     private IEnumerable<ItemSnapshot> OrderItems(VislandSnapshot data, IEnumerable<ItemSnapshot> source,
@@ -983,31 +1251,69 @@ public sealed class Plugin : IDalamudPlugin
         if (mapRouteName == null || routes.All(x => !string.Equals(x.Name, mapRouteName, StringComparison.OrdinalIgnoreCase)))
             mapRouteName = routes.Any(x => string.Equals(x.Name, activeRoute, StringComparison.OrdinalIgnoreCase)) ? activeRoute : routes[0].Name;
         var route = routes.First(x => string.Equals(x.Name, mapRouteName, StringComparison.OrdinalIgnoreCase));
+        var allItems = UniqueItems(snapshot).OrderBy(x => x.Name).ToList();
+        if (mapResourceId == null || allItems.All(x => x.Id != mapResourceId)) mapResourceId = allItems.FirstOrDefault()?.Id;
 
-        ImGui.SetNextItemWidth(Math.Min(520, ImGui.GetContentRegionAvail().X));
-        if (ImGui.BeginCombo("Route", route.Name, ImGuiComboFlags.HeightLarge))
+        var displayMode = (int)mapDisplayMode;
+        ImGui.SetNextItemWidth(230);
+        if (ImGui.Combo("View", ref displayMode, "Selected route\0All registered nodes\0Specific resource\0"))
+            mapDisplayMode = (MapDisplayMode)displayMode;
+        ImGui.SameLine();
+        if (ImGui.Button("Reset view")) { mapZoom = 1; mapPan = Vector2.Zero; }
+        ImGui.SameLine(); ImGui.TextDisabled($"{mapZoom:F1}x");
+
+        if (mapDisplayMode == MapDisplayMode.SelectedRoute)
         {
-            foreach (var candidate in routes.OrderBy(x => x.Name))
+            ImGui.SetNextItemWidth(Math.Min(520, ImGui.GetContentRegionAvail().X));
+            if (ImGui.BeginCombo("Route", route.Name, ImGuiComboFlags.HeightLarge))
             {
-                if (!ImGui.Selectable(candidate.Name, candidate == route)) continue;
-                mapRouteName = candidate.Name;
-                route = candidate;
+                foreach (var candidate in routes.OrderBy(x => x.Name))
+                {
+                    if (!ImGui.Selectable(candidate.Name, candidate == route)) continue;
+                    mapRouteName = candidate.Name;
+                    route = candidate;
+                }
+                ImGui.EndCombo();
             }
-            ImGui.EndCombo();
+            if (activeRoute != null && routes.Any(x => string.Equals(x.Name, activeRoute, StringComparison.OrdinalIgnoreCase)))
+            {
+                ImGui.SameLine();
+                if (ImGui.Button("Show active route"))
+                {
+                    mapRouteName = activeRoute;
+                    route = routes.First(x => string.Equals(x.Name, activeRoute, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+            var resources = string.Join(", ", route.Items.Select(x => x.Name));
+            ImGui.TextWrapped($"{route.Waypoints.Count} waypoints  |  {(route.RequiresFlying ? "flight required" : "ground/underwater compatible")}"
+                              + (string.IsNullOrWhiteSpace(resources) ? string.Empty : $"  |  {resources}"));
         }
-        if (activeRoute != null && routes.Any(x => string.Equals(x.Name, activeRoute, StringComparison.OrdinalIgnoreCase)))
+        else if (mapDisplayMode == MapDisplayMode.Resource && allItems.Count > 0)
         {
-            ImGui.SameLine();
-            if (ImGui.Button("Show active route"))
+            var selected = allItems.First(x => x.Id == mapResourceId);
+            ImGui.SetNextItemWidth(Math.Min(420, ImGui.GetContentRegionAvail().X));
+            if (ImGui.BeginCombo("Resource", selected.Name, ImGuiComboFlags.HeightLarge))
             {
-                mapRouteName = activeRoute;
-                route = routes.First(x => string.Equals(x.Name, activeRoute, StringComparison.OrdinalIgnoreCase));
+                foreach (var item in allItems)
+                {
+                    if (!ImGui.Selectable(item.Name, item.Id == mapResourceId)) continue;
+                    mapResourceId = item.Id;
+                    selected = item;
+                }
+                ImGui.EndCombo();
             }
         }
-        var resources = string.Join(", ", route.Items.Select(x => x.Name));
-        ImGui.TextWrapped($"{route.Waypoints.Count} waypoints  |  {(route.RequiresFlying ? "flight required" : "ground/underwater compatible")}"
-                          + (string.IsNullOrWhiteSpace(resources) ? string.Empty : $"  |  {resources}"));
-        ImGui.TextDisabled("Island map texture with game-coordinate route overlay. Hover the map or a waypoint for coordinates.");
+
+        var allNodes = routes.SelectMany(x => x.Nodes).GroupBy(NodeKey).Select(x => x.First()).ToList();
+        var visibleNodes = mapDisplayMode switch
+        {
+            MapDisplayMode.AllNodes => allNodes,
+            MapDisplayMode.Resource when mapResourceId.HasValue => allNodes.Where(x => x.ItemIds.Contains(mapResourceId.Value)).ToList(),
+            _ => route.Nodes.GroupBy(NodeKey).Select(x => x.First()).ToList(),
+        };
+        if (mapDisplayMode != MapDisplayMode.SelectedRoute)
+            ImGui.TextWrapped($"Showing {visibleNodes.Count} registered gathering node(s). Routes are hidden in this view.");
+        ImGui.TextDisabled("Mouse wheel: zoom around cursor. Left-drag: pan. Hover a gathering point for resources and coordinates.");
 
         var available = ImGui.GetContentRegionAvail();
         var side = Math.Clamp(Math.Min(available.X, available.Y), 240f, 900f);
@@ -1016,21 +1322,37 @@ public sealed class Plugin : IDalamudPlugin
         ImGui.InvisibleButton("##RouteMapCanvas", canvasSize);
         var topLeft = ImGui.GetItemRectMin();
         var bottomRight = ImGui.GetItemRectMax();
+        var mouse = ImGui.GetMousePos();
+        var mapHovered = ImGui.IsItemHovered();
+        var io = ImGui.GetIO();
+        if (mapHovered && Math.Abs(io.MouseWheel) > .01f)
+        {
+            var oldZoom = mapZoom;
+            mapZoom = Math.Clamp(mapZoom * MathF.Pow(1.15f, io.MouseWheel), .75f, 5f);
+            var baseCenter = topLeft + canvasSize * .5f;
+            var relative = mouse - baseCenter - mapPan;
+            mapPan += relative * (1 - mapZoom / oldZoom);
+        }
+        if (mapHovered && ImGui.IsMouseDown(ImGuiMouseButton.Left)) mapPan += io.MouseDelta;
+        var center = topLeft + canvasSize * .5f + mapPan;
         var draw = ImGui.GetWindowDrawList();
         var background = ImGui.ColorConvertFloat4ToU32(new Vector4(.035f, .055f, .06f, .96f));
         var border = ImGui.ColorConvertFloat4ToU32(new Vector4(.65f, .7f, .7f, 1));
         var grid = ImGui.ColorConvertFloat4ToU32(new Vector4(.75f, .82f, .8f, .22f));
         draw.AddRectFilled(topLeft, bottomRight, background);
+        draw.PushClipRect(topLeft, bottomRight, true);
         var mapTexture = services.Textures.GetFromGame(IslandMapTexturePath).GetWrapOrEmpty();
-        if (mapTexture != null) draw.AddImage(mapTexture.Handle, topLeft, bottomRight);
-        draw.AddRect(topLeft, bottomRight, border);
+        if (mapTexture != null)
+        {
+            var halfTexture = canvasSize * .5f * mapZoom;
+            draw.AddImage(mapTexture.Handle, center - halfTexture, center + halfTexture);
+        }
 
         // FFXIV map rows are centered on pixel 1024 of a 2048px texture. Island Sanctuary is map h1m2/02,
         // SizeFactor 100 with offsets (-175, 138), so route positions can be placed without hand-tuned bounds.
         Vector2 ToCanvas(Vector3 world) => new(
-            topLeft.X + canvasSize.X * .5f + (world.X + IslandMapOffsetX) * IslandMapSizeFactor * canvasSize.X / 2048f,
-            topLeft.Y + canvasSize.Y * .5f + (world.Z + IslandMapOffsetZ) * IslandMapSizeFactor * canvasSize.Y / 2048f);
-        draw.PushClipRect(topLeft, bottomRight, true);
+            center.X + (world.X + IslandMapOffsetX) * IslandMapSizeFactor * canvasSize.X / 2048f * mapZoom,
+            center.Y + (world.Z + IslandMapOffsetZ) * IslandMapSizeFactor * canvasSize.Y / 2048f * mapZoom);
         for (var x = -800; x <= 800; x += 200)
         {
             var a = ToCanvas(new Vector3(x, 0, -1100));
@@ -1053,26 +1375,45 @@ public sealed class Plugin : IDalamudPlugin
             : point.Movement == RouteMovement.MountFly ? flyingColor
             : point.Movement == RouteMovement.MountNoFly ? mountColor : normalColor;
 
-        for (var index = 0; index < route.Waypoints.Count; index++)
+        if (mapDisplayMode == MapDisplayMode.SelectedRoute)
         {
-            var from = ToCanvas(route.Waypoints[index].Position);
-            var next = route.Waypoints[(index + 1) % route.Waypoints.Count];
-            draw.AddLine(from, ToCanvas(next.Position), MovementColor(next), 2f);
+            for (var index = 0; index < route.Waypoints.Count; index++)
+            {
+                var from = ToCanvas(route.Waypoints[index].Position);
+                var next = route.Waypoints[(index + 1) % route.Waypoints.Count];
+                draw.AddLine(from, ToCanvas(next.Position), MovementColor(next), 2f);
+            }
         }
 
-        var mouse = ImGui.GetMousePos();
         RouteWaypointSnapshot? hovered = null;
+        RouteNodeSnapshot? hoveredNode = null;
         var hoveredIndex = -1;
-        for (var index = 0; index < route.Waypoints.Count; index++)
+        if (mapDisplayMode == MapDisplayMode.SelectedRoute)
         {
-            var point = route.Waypoints[index];
-            var screen = ToCanvas(point.Position);
-            var radius = point.ObjectId != 0 ? 5f : 3.5f;
-            draw.AddCircleFilled(screen, radius, MovementColor(point));
-            if (Vector2.Distance(mouse, screen) <= radius + 5)
+            for (var index = 0; index < route.Waypoints.Count; index++)
             {
-                hovered = point;
-                hoveredIndex = index;
+                var point = route.Waypoints[index];
+                var screen = ToCanvas(point.Position);
+                var radius = point.ObjectId != 0 ? 5f : 3.5f;
+                draw.AddCircleFilled(screen, radius, MovementColor(point));
+                if (Vector2.Distance(mouse, screen) <= radius + 5)
+                {
+                    hovered = point;
+                    hoveredIndex = index;
+                    hoveredNode = visibleNodes.FirstOrDefault(x => x.ObjectId == point.ObjectId && point.ObjectId != 0)
+                                  ?? visibleNodes.FirstOrDefault(x => Vector3.Distance(x.Position, point.Position) < 1f);
+                }
+            }
+        }
+        else
+        {
+            var nodeColor = ImGui.ColorConvertFloat4ToU32(new Vector4(.35f, .95f, .55f, 1));
+            foreach (var node in visibleNodes)
+            {
+                var screen = ToCanvas(node.Position);
+                draw.AddCircleFilled(screen, 5f, RouteAccessibility.IsUnderwater(node.Position) ? underwaterColor : nodeColor);
+                draw.AddCircle(screen, 6.5f, 0xC0000000, 0, 1.5f);
+                if (Vector2.Distance(mouse, screen) <= 10) hoveredNode = node;
             }
         }
 
@@ -1085,12 +1426,13 @@ public sealed class Plugin : IDalamudPlugin
         }
         draw.AddText(topLeft + new Vector2(8, 7), 0xFFFFFFFF, "N");
         draw.PopClipRect();
+        draw.AddRect(topLeft, bottomRight, border);
 
-        if (ImGui.IsItemHovered())
+        if (mapHovered)
         {
             var worldAtMouse = new Vector2(
-                (mouse.X - topLeft.X - canvasSize.X * .5f) * 2048f / canvasSize.X / IslandMapSizeFactor - IslandMapOffsetX,
-                (mouse.Y - topLeft.Y - canvasSize.Y * .5f) * 2048f / canvasSize.Y / IslandMapSizeFactor - IslandMapOffsetZ);
+                (mouse.X - center.X) * 2048f / canvasSize.X / IslandMapSizeFactor / mapZoom - IslandMapOffsetX,
+                (mouse.Y - center.Y) * 2048f / canvasSize.Y / IslandMapSizeFactor / mapZoom - IslandMapOffsetZ);
             ImGui.BeginTooltip();
             if (hovered != null)
             {
@@ -1099,7 +1441,14 @@ public sealed class Plugin : IDalamudPlugin
                 ImGui.TextUnformatted(RouteAccessibility.IsUnderwater(hovered.Position) ? "Underwater" : hovered.Movement.ToString());
                 if (!string.IsNullOrWhiteSpace(hovered.ObjectName)) ImGui.TextUnformatted(hovered.ObjectName);
             }
-            else ImGui.TextUnformatted($"X {worldAtMouse.X:F1}  Z {worldAtMouse.Y:F1}");
+            if (hoveredNode != null)
+            {
+                if (hovered == null) ImGui.TextUnformatted($"X {hoveredNode.Position.X:F1}  Y {hoveredNode.Position.Y:F1}  Z {hoveredNode.Position.Z:F1}");
+                var names = hoveredNode.ItemIds.Select(id => allItems.FirstOrDefault(x => x.Id == id)?.Name ?? id.ToString()).Distinct();
+                ImGui.TextWrapped($"Resources: {string.Join(", ", names)}");
+                if (!string.IsNullOrWhiteSpace(hoveredNode.ObjectName)) ImGui.TextDisabled(hoveredNode.ObjectName);
+            }
+            else if (hovered == null) ImGui.TextUnformatted($"X {worldAtMouse.X:F1}  Z {worldAtMouse.Y:F1}");
             ImGui.EndTooltip();
         }
     }
@@ -1183,7 +1532,7 @@ public sealed class Plugin : IDalamudPlugin
         var priority = (int)config.ResourcePriority;
         ImGui.SetNextItemWidth(Math.Min(420, ImGui.GetContentRegionAvail().X));
         if (ImGui.Combo("##ResourcePriority", ref priority,
-                "Largest relative deficit (recommended)\0Lowest current stock\0Highest current stock\0Fastest best route\0"))
+                "Largest relative deficit (strict)\0Lowest current stock\0Highest current stock\0Best overall route progress (recommended)\0"))
         {
             config.ResourcePriority = (ResourcePriority)priority;
             Save();
@@ -1192,14 +1541,14 @@ public sealed class Plugin : IDalamudPlugin
         {
             ResourcePriority.LowestStock => "Farms the enabled resource with the smallest raw inventory count first.",
             ResourcePriority.HighestStock => "Farms the enabled unfinished resource with the largest raw inventory count first.",
-            ResourcePriority.FastestRoute => "Prefers the resource whose best compatible route contains the most matching nodes.",
-            _ => "Compares current stock to each target, so resources with different targets stay balanced.",
+            ResourcePriority.FastestRoute => "Balances useful unfinished resources per loop against route length, approach distance, and already-complete nodes.",
+            _ => "Strictly farms the largest current/target deficit first, even when its compatible route has a low yield.",
         });
 
         ImGui.Spacing();
         ImGui.TextUnformatted("Stuck recovery");
         var skipStuck = config.SkipStuckRoutes;
-        if (ImGui.Checkbox("Temporarily skip a route when its approach is stuck", ref skipStuck))
+        if (ImGui.Checkbox("Temporarily skip a route when navigation stops making progress", ref skipStuck))
         {
             config.SkipStuckRoutes = skipStuck;
             Save();
@@ -1213,6 +1562,7 @@ public sealed class Plugin : IDalamudPlugin
             Save();
         }
         if (!config.SkipStuckRoutes) ImGui.EndDisabled();
+        ImGui.TextDisabled("Allowed range: 8-60 seconds. Shorter timeouts can trigger during normal pathfinding, mounting, or gathering.");
         ImGui.TextDisabled("A skipped farming route cools down for 5 minutes while another route or resource is selected.");
     }
 
@@ -1365,7 +1715,16 @@ public sealed class Plugin : IDalamudPlugin
         else if (data.FlightUnlocked == false) ImGui.TextDisabled("Island flight is locked; flying routes and their exclusive resources are ignored.");
         else ImGui.TextDisabled("Travel to your Island to detect flight access; only ground routes are available until then.");
         ImGui.TextDisabled($"Considering {compatible.Count} of {data.Routes.Count} imported Island routes.");
+        if (config.ResourcePriority == ResourcePriority.FastestRoute)
+        {
+            var next = SelectNextRoute(data);
+            if (next != null)
+                ImGui.TextColored(new Vector4(.45f, .85f, 1f, 1),
+                    $"Best overall now: {next.Value.Route.Name} (recalculate when {next.Value.Item.Name} reaches target)");
+            ImGui.TextDisabled("This mode scores all unfinished enabled resources in each route and includes loop length, approach distance, and wasted completed nodes.");
+        }
         ImGui.Spacing();
+        ImGui.TextDisabled("Per-resource route reference:");
         foreach (var item in UniqueItems(data).Where(x => IsEffectivelyEnabled(x.Id)).OrderBy(x => x.Name))
         {
             var candidates = compatible.Select(route => (Route: route, Item: route.Items.FirstOrDefault(x => x.Id == item.Id)))
@@ -1398,7 +1757,7 @@ public sealed class Plugin : IDalamudPlugin
         if (ImGui.Button("Generate preview")) GenerateExperimentalRoute(data);
         if (!canGenerate) ImGui.EndDisabled();
         ImGui.SameLine();
-        var canRun = canGenerate && experimentalRoute != null && adapter.IsNavmeshReady;
+        var canRun = canGenerate && experimentalRoute != null && adapter.IsNavmeshReady && data.FlightUnlocked == true;
         if (!canRun) ImGui.BeginDisabled();
         if (ImGui.Button("Run one test loop") && experimentalRoute != null)
         {
@@ -1412,6 +1771,9 @@ public sealed class Plugin : IDalamudPlugin
         if (!testActive) ImGui.EndDisabled();
         ImGui.TextWrapped(experimentalStatus);
         if (!adapter.IsNavmeshReady) ImGui.TextDisabled("vnavmesh must be installed and ready to test a generated route.");
+        else if (data.FlightUnlocked != true)
+            ImGui.TextColored(new Vector4(1f, .65f, .25f, 1),
+                "Ground test loops are disabled: generated node-to-node legs are not yet navmesh-validated and may cross terrain. The map preview remains available.");
     }
 
     private void GenerateExperimentalRoute(VislandSnapshot data)
@@ -1579,16 +1941,10 @@ public sealed class Plugin : IDalamudPlugin
             status = "Visland Auto Export disabled; continuing to the exporter.";
             return true;
         }
-        if (data.IsRunning) { status = "Going to the Island exporter..."; return true; }
-        var select = (AtkUnitBase*)services.GameGui.GetAddonByName("SelectString").Address;
-        if (select != null && select->IsVisible && select->IsReady)
-        {
-            var value = stackalloc AtkValue[1]; value[0].Type = AtkValueType.Int; value[0].Int = 0; select->FireCallback(1, value);
-            status = "Opening Export Materials..."; return true;
-        }
         var shop = (AtkUnitBase*)services.GameGui.GetAddonByName("MJIDisposeShop").Address;
         if (shop != null && shop->IsVisible)
         {
+            if (data.IsRunning) adapter.Stop();
             if (!exportSubmitted)
             {
                 var soldTypes = ExportConfiguredSurplus();
@@ -1599,12 +1955,114 @@ public sealed class Plugin : IDalamudPlugin
             if (DateTime.UtcNow >= closeExportAfter)
             {
                 var value = stackalloc AtkValue[1]; value[0].Type = AtkValueType.Int; value[0].Int = 1; shop->FireCallback(1, value);
-                exportTrip = false; activeRoute = null; nextStartAttempt = DateTime.UtcNow.AddSeconds(3); status = "Export complete; resuming farming.";
+                exportTrip = false;
+                activeRoute = null;
+                leavingExporter = true;
+                exporterExitNavigationRequested = false;
+                exporterExitStartedAt = DateTime.UtcNow;
+                exporterExitLastProgressAt = DateTime.UtcNow;
+                exporterExitLastDistance = float.MaxValue;
+                nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
+                status = "Export complete; walking outside before resuming farming.";
             }
             return true;
         }
-        if (DateTime.UtcNow - exportTripStarted > TimeSpan.FromSeconds(30)) { exportTrip = false; status = "Export trip timed out; check access to the exporter."; }
+        var select = (AtkUnitBase*)services.GameGui.GetAddonByName("SelectString").Address;
+        if (select != null && select->IsVisible && select->IsReady)
+        {
+            if (data.IsRunning) adapter.Stop();
+            var value = stackalloc AtkValue[1]; value[0].Type = AtkValueType.Int; value[0].Int = 0; select->FireCallback(1, value);
+            status = "Opening Export Materials..."; return true;
+        }
+
+        var player = services.Objects.LocalPlayer;
+        var exporter = services.Objects.FirstOrDefault(x => x.BaseId == ExporterObjectId && x.IsTargetable);
+        if (player != null && exporter != null && Vector3.Distance(player.Position, exporter.Position) <= 7f)
+        {
+            if (data.IsRunning)
+            {
+                adapter.Stop();
+                status = "Reached the Island exporter; stopping the travel route before interaction...";
+                return true;
+            }
+            if (DateTime.UtcNow >= nextExporterInteractionAttempt)
+            {
+                nextExporterInteractionAttempt = DateTime.UtcNow.AddSeconds(2);
+                var targetSystem = TargetSystem.Instance();
+                if (targetSystem != null)
+                    targetSystem->InteractWithObject((GameObject*)exporter.Address, false);
+            }
+            status = "Talking to the Island exporter...";
+            return true;
+        }
+
+        if (data.IsRunning) { status = "Going to the Island exporter..."; return true; }
+        if (DateTime.UtcNow - exportTripStarted > TimeSpan.FromSeconds(60))
+        {
+            exportTrip = false;
+            activeRoute = null;
+            status = "Export trip timed out; the exporter could not be reached or opened.";
+        }
         return exportTrip;
+    }
+
+    private void HandleExporterExit(VislandSnapshot data)
+    {
+        if (data.IsRunning) adapter.Stop();
+        var player = services.Objects.LocalPlayer;
+        if (player == null)
+        {
+            status = "Waiting for the character before leaving the exporter.";
+            return;
+        }
+
+        var distance = Vector3.Distance(player.Position, IslandBaseExterior);
+        if (distance <= 6f)
+        {
+            adapter.StopNavigation();
+            leavingExporter = false;
+            exporterExitNavigationRequested = false;
+            nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
+            status = "Outside the exporter; recalculating the next route.";
+            return;
+        }
+
+        if (distance + 1f < exporterExitLastDistance)
+        {
+            exporterExitLastDistance = distance;
+            exporterExitLastProgressAt = DateTime.UtcNow;
+        }
+        else if (DateTime.UtcNow - exporterExitLastProgressAt
+                 > TimeSpan.FromSeconds(Math.Clamp(config.StuckTimeoutSeconds, 8, 60)))
+        {
+            adapter.StopNavigation();
+            exporterExitNavigationRequested = false;
+            TryUseIsleReturn();
+            nextIsleReturnAttempt = DateTime.UtcNow.AddSeconds(2);
+            exporterExitLastProgressAt = DateTime.UtcNow;
+            status = "The cabin exit was blocked; using Isle Return to reach the base exterior...";
+            return;
+        }
+
+        if (exporterExitNavigationRequested && !adapter.IsNavigationBusy)
+            exporterExitNavigationRequested = false;
+        if (!exporterExitNavigationRequested)
+        {
+            if (!adapter.TryNavigateTo(IslandBaseExterior, false, out var error))
+            {
+                if (DateTime.UtcNow - exporterExitStartedAt > TimeSpan.FromSeconds(10)
+                    && DateTime.UtcNow >= nextIsleReturnAttempt)
+                {
+                    TryUseIsleReturn();
+                    nextIsleReturnAttempt = DateTime.UtcNow.AddSeconds(2);
+                    status = "Could not path out of the cabin; using Isle Return...";
+                }
+                else status = $"Walking out of the exporter failed: {error}";
+                return;
+            }
+            exporterExitNavigationRequested = true;
+        }
+        status = $"Walking out of the exporter before mounting... ({distance:F0} yalms)";
     }
 
     private unsafe int ExportConfiguredSurplus()
@@ -1658,10 +2116,20 @@ public sealed class Plugin : IDalamudPlugin
         Experimental,
     }
 
-    private sealed class PendingRouteStart(RouteSnapshot route, string? itemName, PendingRoutePurpose purpose, int startIndex)
+    private enum MapDisplayMode
+    {
+        SelectedRoute,
+        AllNodes,
+        Resource,
+    }
+
+    private sealed class PendingRouteStart(RouteSnapshot route, int? itemId, string? itemName, int? itemGoal,
+        PendingRoutePurpose purpose, int startIndex)
     {
         public RouteSnapshot Route { get; } = route;
+        public int? ItemId { get; } = itemId;
         public string? ItemName { get; } = itemName;
+        public int? ItemGoal { get; } = itemGoal;
         public PendingRoutePurpose Purpose { get; } = purpose;
         public int StartIndex { get; } = startIndex;
         public bool NavigationRequested { get; set; }
@@ -1670,6 +2138,9 @@ public sealed class Plugin : IDalamudPlugin
         public DateTime LastProgressAt { get; set; } = DateTime.UtcNow;
         public DateTime? DiveStartedAt { get; set; }
         public DateTime? MountStartedAt { get; set; }
+        public bool UseIsleReturn { get; set; }
+        public DateTime? IsleReturnStartedAt { get; set; }
+        public bool ExitingCabin { get; set; }
     }
 
     private sealed record MountOption(uint Id, string Name);

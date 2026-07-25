@@ -5,9 +5,9 @@
   "Description": "Choose Island resources and stock levels, then let Stock Manager select imported Visland routes. Supports sortable resources, farming priorities, flight and underwater navigation, an Island route map, mount override, stuck recovery, Lifestream, surplus export, run statistics, and /sm commands.",
   "RepoUrl": "https://github.com/CheesyChiz/StockManager",
   "IconUrl": "https://raw.githubusercontent.com/CheesyChiz/StockManager/main/assets/icon.png",
-  "Changelog": "Fixed underwater approaches: surface swimming now continues until diving succeeds, manual dives rebuild a mounted 3D path, and active Visland paths are no longer interrupted. Added the real Island map texture with coordinate-accurate route overlays. Visland Auto Export is now disabled defensively before every Stock Manager export trip.",
+  "Changelog": "Added route-wide progress scoring with travel costs, mid-loop target switching, and active-route stuck recovery. Export trips now use Isle Return, stop at the NPC, and exit the cabin before mounting. Added map zoom, pan, all-node/resource filters, and tooltips. Unsafe generated ground tests are disabled pending validation.",
   "InternalName": "StockManager",
-  "AssemblyVersion": "1.5.1.0",
+  "AssemblyVersion": "1.6.0.0",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
   "Tags": ["Island Sanctuary", "Visland", "Automation"]

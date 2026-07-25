@@ -8,12 +8,12 @@
   Automatic Island Sanctuary stock balancing with routes imported into Visland.
 </p>
 
-Stock Manager keeps selected gathering resources at your chosen levels. It runs one Visland route at a time, checks the Island inventory after every loop, and selects the next resource using your chosen priority strategy.
+Stock Manager keeps selected gathering resources at your chosen levels. It runs one Visland route at a time, watches Island inventory while the route is active, and recalculates as soon as the current target is reached.
 
 ## Features
 
 - Uses routes already imported into Visland's `Island` group.
-- Offers relative-deficit, lowest-stock, highest-stock, and fastest-route farming priorities.
+- Offers strict relative-deficit, lowest-stock, highest-stock, and overall route-progress farming priorities.
 - Enables resources independently without losing their configured stock values.
 - Sorts the resource table by any column.
 - Selects the best compatible imported route automatically for each enabled resource.
@@ -21,12 +21,14 @@ Stock Manager keeps selected gathering resources at your chosen levels. It runs 
 - Offers mount roulette and every unlocked mount in one dropdown; a specific selection also replaces Visland's roulette during Stock Manager routes.
 - Detects Island flight at Sanctuary Rank 10 and excludes flight-only routes and high-altitude nodes while it is locked.
 - Enters water, dives, rebuilds navigation in 3D, and mounts underwater when an imported route requires it.
-- Can temporarily skip a route whose vnavmesh approach makes no progress and try another route or resource.
-- Detects resources locked by Island progression or missing tools and ignores them automatically.
+- Can temporarily skip an approach or active route that makes no movement or gathering progress and try another route or resource.
+- Uses the game's item/tool availability flags and ignores unavailable resources automatically.
 - Optionally uses Lifestream to travel to the Island from a button or when automation starts.
 - Can stop when all managed resources reach their targets.
 - Can continue farming and export surplus materials for cowries using individual sell limits.
-- Includes the in-game Island map texture with coordinate-accurate route overlays and a clustered experimental route generator based on imported nodes.
+- Uses **Isle Return** before long exporter trips, stops the travel route at the NPC, and walks out of the cabin before trying to mount again.
+- Includes a zoomable, pannable Island map with route overlays, all-node and per-resource views, and resource tooltips.
+- Includes a clustered experimental route preview based on imported nodes.
 
 ## Requirements
 
@@ -63,11 +65,17 @@ Installing through the custom repository provides normal Dalamud update notifica
    - **Farm and export for cowries** continues gathering and sells configured surplus.
 4. Click **Start automation**. Stock Manager selects routes automatically from the imported `Island` group.
 
-Click the `Resource`, `Current`, stock-value, or `Status` table header to sort the resource list. The default priority is **Largest relative deficit**, which compares each current count to its own target instead of comparing raw counts.
+Click the `Resource`, `Current`, stock-value, or `Status` table header to sort the resource list. New installations default to **Best overall route progress**. Existing installations keep their selected priority.
+
+The farming priorities intentionally behave differently:
+
+- **Largest relative deficit (strict)** selects the resource with the lowest `current / target` ratio first. It may keep choosing a long route that contains only one or two matching nodes when that resource is far behind.
+- **Best overall route progress** scores every compatible route using all enabled unfinished resources it can advance. It also considers useful node yield, remaining deficits, already-complete nodes, estimated loop length, and the approach from the character's current position. To prevent long-distance ping-pong, it keeps the current area while its route remains within 80% of the best score.
+- **Lowest current stock** and **Highest current stock** compare raw inventory counts.
 
 Only enabled, unlocked resources served by at least one compatible imported route participate in completion checks.
 
-In **Stop** mode, a resource is unchecked for the current run as soon as it reaches its target; no restart is required before the next resource is selected. This is session state only: the saved selection returns on the next start. Raising the target or consuming stock below it during the same run activates the resource again automatically.
+In **Stop** mode, a resource is unchecked for the current run as soon as it reaches its target. If it was the current route target, Stock Manager stops that loop and recalculates immediately; no manual restart is required. This is session state only: the saved selection returns on the next start. Raising the target or consuming stock below it during the same run activates the resource again automatically.
 
 ## Stock values and exporting
 
@@ -90,16 +98,19 @@ The stock value plus the export batch can never exceed the Island material cap o
 
 Stock Manager owns surplus selling in export mode and automatically disables Visland's global **Auto Export** option before travelling to the shop, so there is only one active set of export rules. Visland's **Exports Automation** window may still be opened manually, but its **Auto Export** checkbox must remain off while Stock Manager is running; the plugin enforces this again before each export trip.
 
+For a distant export trip, Stock Manager uses the Island's **Isle Return** action and then runs only the short exterior-to-exporter path. It stops Visland at the NPC before opening the menus, preventing the one-shot route from walking back to its beginning. After selling, it walks to the base exterior before the next mount attempt; if the cabin exit path fails, Isle Return is used as a fallback.
+
 ## Route rules
 
 - Routes are not enabled manually. A checked resource is the single source of truth, and Stock Manager chooses its best available route by yield and current deficits.
 - Stock Manager asks vnavmesh to path from the character's current position to the selected route. It does not return to the Island base first.
 - For a longer transfer, Stock Manager mounts before starting vnavmesh. The mount dropdown begins with roulette and then lists every unlocked mount. A specific selection is applied both to the transfer and to mount requests made by Visland while a Stock Manager route is active.
+- If a mount remains unavailable near the Cozy Cabin, Stock Manager first walks to the base exterior instead of retrying the mount indoors.
 - When the character is already within 35 yalms of a route, the closest waypoint becomes the start of that loop. Otherwise Stock Manager approaches the route's original first waypoint.
 - While on the Island, Sanctuary Rank 10 and the game's flight-access flag are checked together.
 - If flight is locked, routes named as flying routes, routes containing high-altitude-only nodes, and surface routes that require `MountFly` are ignored. Mixed surface/underwater routes remain usable and their surface transfer is downgraded to ground-mounted movement.
 - Underwater route approaches keep swimming on the surface until diving is possible, then dismount, dive, mount underwater, and ask vnavmesh for a 3D path. A manual dive is detected and causes the same mounted repath. Once Visland starts the route, Stock Manager no longer interrupts its active underwater path.
-- Optional stuck recovery measures progress toward the route start. After the configured timeout, the route cools down for five minutes and another eligible choice is made.
+- Optional stuck recovery measures both movement and inventory progress during the approach and active gathering loop. After the configured timeout, the route cools down for five minutes and another eligible choice is made. The supported timeout range is 8-60 seconds; a lower value would commonly fire during normal pathfinding, mounting, or gathering animations.
 - Routes with no recognized Island gathering nodes are ignored.
 
 Stock Manager currently recognizes the English interaction names used by the commonly distributed Island route collection.
@@ -108,9 +119,9 @@ Stock Manager currently recognizes the English interaction names used by the com
 
 Expand **Experimental route generator** under the automatic route summary to build a temporary mixed-resource route. It finds a compact cluster that covers the checked resources, fills the route with nearby target nodes using the smallest added detour, adds support nodes only when needed for a stable 11-node loop, and orders the result into a short cycle. Nearby hops are marked for walking; longer legs use the selected mount.
 
-When flight is locked, flight-only source routes and high-altitude nodes are excluded from generation. Generated previews are not saved to Visland and are not used by normal automation yet. Their displayed length is a straight-line estimate; terrain-aware movement is handled by vnavmesh during the test. Use **Stop test loop** to end only the generated test, or **Emergency stop** if all automation must be aborted.
+When flight is locked, flight-only source routes and high-altitude nodes are excluded from generation. That does not prove that every remaining node-to-node leg is reachable: an imported node can sit behind progression-gated terrain, and the current generator does not preserve all traversal waypoints from its source route. For safety, generated ground test loops are disabled until those legs can be navmesh-validated. The preview remains available on the map. With Island flight unlocked, use **Stop test loop** to end only the generated test, or **Emergency stop** if all automation must be aborted.
 
-The **Map** tab uses the in-game Island map texture at a fixed square aspect ratio. Imported routes and the latest generated preview are placed using the map's real size factor and offsets; the overlay shows waypoint links, walking/mounted/flying/underwater movement, gathering nodes, the player position, and hover coordinates.
+The **Map** tab uses the in-game Island map texture at a fixed square aspect ratio. Imported routes and the latest generated preview are placed using the map's real size factor and offsets. Use the mouse wheel to zoom around the cursor, left-drag to pan, and **Reset view** to return to the default framing. The view selector can show one route, all registered gathering nodes, or only nodes for one resource. Hover a gathering point to see its resources and world coordinates.
 
 ## Commands
 
