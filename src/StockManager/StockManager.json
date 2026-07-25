@@ -1,11 +1,11 @@
 {
   "Author": "CheesyChiz",
   "Name": "Stock Manager",
-  "Punchline": "Balances Island Sanctuary resources with ExplorersIcebox routes.",
-  "Description": "An unofficial extension for ExplorersIcebox that automatically switches routes based on the largest relative resource deficit. ExplorersIcebox must be installed separately from Ice's repository.",
+  "Punchline": "Balances Island Sanctuary resources with imported Visland routes.",
+  "Description": "Automatically switches between Island gathering routes imported into Visland based on the largest relative resource deficit.",
   "InternalName": "StockManager",
-  "AssemblyVersion": "1.0.1.0",
+  "AssemblyVersion": "1.1.0.0",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
-  "Tags": ["Island Sanctuary", "ExplorersIcebox", "Automation"]
+  "Tags": ["Island Sanctuary", "Visland", "Automation"]
 }

@@ -1,12 +1,13 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>1.0.1.0</Version>
-    <Description>Unofficial stock-balancing extension for ExplorersIcebox.</Description>
+    <Version>1.1.0.0</Version>
+    <Description>Automatic Island Sanctuary stock balancing with imported Visland routes.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <IsPackable>true</IsPackable>
     <TargetFramework>net10.0-windows8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <Content Include="StockManager.json" />

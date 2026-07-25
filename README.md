@@ -1,56 +1,54 @@
 # Stock Manager
 
-Неофициальное расширение для `ExplorersIcebox`, автоматически переключающее маршруты Island Sanctuary в зависимости от нехватки ресурсов.
+Stock Manager automatically balances Island Sanctuary gathering resources by running routes imported into Visland.
 
-Stock Manager выбирает предмет с минимальным отношением `текущее количество / цель`, затем запускает разрешённый маршрут с наибольшим количеством этого предмета за круг. После завершения задания запасы перечитываются и решение принимается заново.
+It selects the resource with the lowest `current amount / target` ratio, chooses an enabled route that gathers it, runs that route once through Visland, and reevaluates the inventory after the route finishes.
 
-Проект не содержит и не распространяет исходники или DLL ExplorersIcebox. Оригинальный плагин устанавливается отдельно из репозитория его автора Ice.
+Stock Manager is an independent plugin. It does not contain or depend on ExplorersIcebox files.
 
-## Требования
+## Requirements
 
-- Dalamud API 15;
-- ExplorersIcebox 1.1.0.3 из репозитория Ice;
-- Visland;
-- vnavmesh.
+- Dalamud API 15
+- Visland with Island gathering routes imported into the `Island` group
+- vnavmesh, as required by Visland route execution
 
-## Установка
+## Installation
 
-В `/xlsettings` → **Experimental** → **Custom Plugin Repositories** добавьте оба URL:
+Add this URL under `/xlsettings` → **Experimental** → **Custom Plugin Repositories**:
 
 ```text
-https://puni.sh/api/repository/ice
 https://raw.githubusercontent.com/CheesyChiz/StockManager/main/repo.json
 ```
 
-Затем откройте `/xlplugins`:
+Then open `/xlplugins`, install **Stock Manager**, and open it with `/stockmanager`.
 
-1. установите и включите оригинальный `ExplorersIcebox`;
-2. установите `Stock Manager`;
-3. откройте менеджер командой `/stockmanager`.
+## Usage
 
-Обновления Stock Manager после этого устанавливаются через Dalamud автоматически.
+- Enter a value in **Target for all resources** and click **Apply to all**, or edit individual resource targets.
+- A target of `0` disables that resource.
+- Choose **Ground only** to reject any route containing a `MountFly` waypoint.
+- Choose **Ground and flying** to allow both kinds of routes. `MountNoFly` waypoints are considered ground-compatible.
+- Resources locked by the current Island Sanctuary progression or missing tools are detected through the game state and ignored automatically.
+- Disable individual routes in the route list when desired.
+- **Emergency stop** disables Stock Manager and stops the current Visland route.
 
-## Использование
+### Completion behavior
 
-- Цель `0` отключает ресурс.
-- В секции маршрутов можно запретить нежелательные маршруты.
-- `Maximum loops before reevaluation` ограничивает число кругов до следующего пересчёта.
-- `Emergency stop` останавливает менеджер и текущее задание ExplorersIcebox.
+- **Stop** disables automation when every available target has been reached.
+- **Farm and export for cowries** keeps gathering after the targets are reached. When any normal material reaches the configured export trigger, Stock Manager runs its built-in Visland route to the Island exporter, selects **Export Materials**, lets Visland Auto Export sell the surplus, and resumes gathering.
 
-Первый запуск рекомендуется выполнить под наблюдением с 1–3 кругами до пересчёта. Окно ExplorersIcebox во время автоматической работы лучше закрыть, чтобы его интерфейс не менял выбранный маршрут.
+The second mode requires **Auto Export** to be enabled in Visland's Exports window. Visland's **Sell normal above** value controls how many materials are kept; Stock Manager never changes that value.
 
-## Совместимость
+Imported routes are read from Visland's own configuration. Stock Manager currently recognizes Island gathering nodes by their English interaction names, as stored by the commonly distributed Island route collection.
 
-У ExplorersIcebox нет публичного API для выбора и запуска маршрутов. Stock Manager использует узкий reflection-адаптер к версии `1.1.0.3`. Если внутреннее устройство ExplorersIcebox изменится, менеджер прекращает запуск маршрутов и показывает ошибку совместимости; после этого адаптер необходимо обновить.
+Use automation at your own risk. Supervise the first run and make sure each imported route works correctly in Visland before enabling automatic switching.
 
-## Сборка
+## Building
 
-Проект рассчитан на .NET 10 и `Dalamud.NET.Sdk 15.0.0`:
+The project targets .NET 10 and `Dalamud.NET.Sdk 15.0.0`:
 
 ```powershell
 dotnet build src/StockManager/StockManager.csproj -c Release
 ```
 
-Stock Manager распространяется по лицензии MIT. ExplorersIcebox принадлежит его автору и устанавливается из его собственного репозитория.
-
-Автоматизация игрового процесса может нарушать правила FFXIV. Используйте на свой риск.
+Stock Manager is distributed under the MIT license.

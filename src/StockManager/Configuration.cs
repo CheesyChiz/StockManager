@@ -4,9 +4,24 @@ namespace StockManager;
 
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 1;
+    public int Version { get; set; } = 2;
     public bool Enabled { get; set; }
-    public int MaxLoopsPerRun { get; set; } = 20;
+    public int BulkTarget { get; set; } = 999;
+    public RouteMovementMode MovementMode { get; set; } = RouteMovementMode.GroundOnly;
+    public CompletionAction CompletionAction { get; set; } = CompletionAction.Stop;
+    public int ExportTrigger { get; set; } = 900;
     public Dictionary<int, int> Targets { get; set; } = new();
     public HashSet<string> ExcludedRoutes { get; set; } = new();
+}
+
+public enum CompletionAction
+{
+    Stop,
+    FarmAndExport,
+}
+
+public enum RouteMovementMode
+{
+    GroundOnly,
+    GroundAndFlying,
 }
