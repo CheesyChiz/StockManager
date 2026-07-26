@@ -26,6 +26,8 @@ public sealed partial class Plugin : IDalamudPlugin
     private const float IslandMapOffsetX = -175f;
     private const float IslandMapOffsetZ = 138f;
     private const uint ExporterObjectId = 1043464;
+    private static readonly TimeSpan ActiveRebalanceMinimumRuntime = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan ActiveRebalanceStableWindow = TimeSpan.FromSeconds(8);
     private static readonly Vector3 IslandBaseExterior = new(-268f, 40f, 226f);
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly Services services;
@@ -84,6 +86,9 @@ public sealed partial class Plugin : IDalamudPlugin
     private Vector3? activeLastPosition;
     private int activeLastInventoryTotal;
     private DateTime activeLastProgressAt = DateTime.MinValue;
+    private DateTime activeRouteStartedAt = DateTime.MinValue;
+    private string? activeRebalanceCandidate;
+    private DateTime activeRebalanceCandidateSince = DateTime.MinValue;
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
@@ -283,6 +288,7 @@ public sealed partial class Plugin : IDalamudPlugin
                 }
             }
             if (HandleActiveFarmTarget(snapshot)) return;
+            if (HandleActiveRouteRebalance(snapshot)) return;
             var trackedItem = activeTargetItemId == null
                 ? null
                 : UniqueItems(snapshot).FirstOrDefault(x => x.Id == activeTargetItemId.Value);
@@ -718,6 +724,9 @@ public sealed partial class Plugin : IDalamudPlugin
                 activeTargetItemName = pending.ItemName;
                 activeTargetGoal = pending.ItemGoal;
                 lastFarmRoute = pending.Route.Name;
+                activeRouteStartedAt = DateTime.UtcNow;
+                activeRebalanceCandidate = null;
+                activeRebalanceCandidateSince = DateTime.MinValue;
                 activeLastPosition = services.Objects.LocalPlayer?.Position;
                 activeLastInventoryTotal = snapshot == null ? 0 : UniqueItems(snapshot).Sum(x => x.CurrentCount);
                 activeLastProgressAt = DateTime.UtcNow;
@@ -746,6 +755,53 @@ public sealed partial class Plugin : IDalamudPlugin
         nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
         status = $"{item.Name} reached {reachedGoal}; stopped {routeName} and recalculating.";
         return true;
+    }
+
+    private bool HandleActiveRouteRebalance(VislandSnapshot data)
+    {
+        if (config.ResourcePriority != ResourcePriority.FastestRoute
+            || activeRoute == null
+            || exportTrip
+            || activeDiveStartedAt != null
+            || activeRouteStartedAt == DateTime.MinValue
+            || DateTime.UtcNow - activeRouteStartedAt < ActiveRebalanceMinimumRuntime)
+        {
+            ResetActiveRebalanceCandidate();
+            return false;
+        }
+
+        // Compare pure route utility here. Respawn detours belong between completed route selections and would
+        // otherwise make a short route look stale while the character is still part-way through its first loop.
+        var recommendation = SelectPhaseRoute(data, false);
+        if (recommendation == null
+            || string.Equals(recommendation.Value.Route.Name, activeRoute, StringComparison.OrdinalIgnoreCase))
+        {
+            ResetActiveRebalanceCandidate();
+            return false;
+        }
+
+        if (!string.Equals(activeRebalanceCandidate, recommendation.Value.Route.Name, StringComparison.OrdinalIgnoreCase))
+        {
+            activeRebalanceCandidate = recommendation.Value.Route.Name;
+            activeRebalanceCandidateSince = DateTime.UtcNow;
+            return false;
+        }
+        if (DateTime.UtcNow - activeRebalanceCandidateSince < ActiveRebalanceStableWindow) return false;
+
+        var previousRoute = activeRoute;
+        var nextRoute = recommendation.Value.Route.Name;
+        adapter.Stop();
+        activeRoute = null;
+        ClearActiveTargetTracking();
+        nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
+        status = $"Stopped {previousRoute}: {nextRoute} remained substantially better; recalculating.";
+        return true;
+    }
+
+    private void ResetActiveRebalanceCandidate()
+    {
+        activeRebalanceCandidate = null;
+        activeRebalanceCandidateSince = DateTime.MinValue;
     }
 
     private bool HandleActiveRouteStuck(VislandSnapshot data)
@@ -793,6 +849,8 @@ public sealed partial class Plugin : IDalamudPlugin
         activeLastPosition = null;
         activeLastInventoryTotal = 0;
         activeLastProgressAt = DateTime.MinValue;
+        activeRouteStartedAt = DateTime.MinValue;
+        ResetActiveRebalanceCandidate();
     }
 
     private unsafe void TryUseConfiguredMount()
@@ -1052,12 +1110,12 @@ public sealed partial class Plugin : IDalamudPlugin
         }
     }
 
-    private (RouteSnapshot Route, ItemSnapshot Item)? SelectNextRoute(VislandSnapshot data)
+    private (RouteSnapshot Route, ItemSnapshot Item)? SelectNextRoute(VislandSnapshot data, bool preferRespawnDetour = true)
     {
         var routes = SelectableRoutes(data);
         var candidates = ManagedItems(data).Where(x => x.IsAvailable)
             .Where(x => config.Targets[x.Id] > x.CurrentCount).ToList();
-        routes = PreferRespawnDetour(routes, candidates);
+        if (preferRespawnDetour) routes = PreferRespawnDetour(routes, candidates);
         if (config.ResourcePriority == ResourcePriority.FastestRoute)
             return SelectBestProgressRoute(routes, candidates, x => config.Targets[x.Id]);
         var items = OrderItems(data, candidates, x => config.Targets[x.Id], routes);
@@ -1072,17 +1130,24 @@ public sealed partial class Plugin : IDalamudPlugin
         return null;
     }
 
-    private (RouteSnapshot Route, ItemSnapshot Item)? SelectCowrieRoute(VislandSnapshot data)
+    private (RouteSnapshot Route, ItemSnapshot Item)? SelectCowrieRoute(VislandSnapshot data, bool preferRespawnDetour = true)
     {
         var routes = SelectableRoutes(data);
         var items = ManagedItems(data).Where(x => x.IsAvailable)
             .Where(x => config.Targets.TryGetValue(x.Id, out var target) && target is > 0 and < 999)
             .Where(x => x.CurrentCount < ExportTrigger(x.Id)).ToList();
-        routes = PreferRespawnDetour(routes, items);
+        if (preferRespawnDetour) routes = PreferRespawnDetour(routes, items);
         // Once every enabled resource has reached its retained stock, the user-selected balancing priority no
         // longer applies. Choose the best overall surplus route so cowrie farming favors useful yield and short
         // travel instead of repeatedly filling the same low-stock material.
         return SelectBestProgressRoute(routes, items, x => ExportTrigger(x.Id));
+    }
+
+    private (RouteSnapshot Route, ItemSnapshot Item)? SelectPhaseRoute(VislandSnapshot data, bool preferRespawnDetour = true)
+    {
+        var choice = SelectNextRoute(data, preferRespawnDetour);
+        if (choice != null || config.CompletionAction != CompletionAction.FarmAndExport) return choice;
+        return SelectCowrieRoute(data, preferRespawnDetour);
     }
 
     private (RouteSnapshot Route, ItemSnapshot Item)? SelectBestProgressRoute(
@@ -1775,10 +1840,24 @@ public sealed partial class Plugin : IDalamudPlugin
         ImGui.TextDisabled($"Considering {compatible.Count} of {data.Routes.Count} imported Island routes.");
         if (config.ResourcePriority == ResourcePriority.FastestRoute)
         {
-            var next = SelectNextRoute(data);
-            if (next != null)
+            var next = SelectPhaseRoute(data, false);
+            if (data.IsRunning && activeRoute != null)
+            {
+                var activeItem = activeTargetItemId.HasValue
+                    ? UniqueItems(data).FirstOrDefault(x => x.Id == activeTargetItemId.Value)
+                    : null;
+                var trigger = activeItem == null || !activeTargetGoal.HasValue
+                    ? ""
+                    : $" | tracked target: {activeItem.Name} {activeItem.CurrentCount}/{activeTargetGoal.Value}";
+                ImGui.TextColored(new Vector4(.45f, .85f, 1f, 1), $"Active overall route: {activeRoute}{trigger}");
+                if (next != null && !string.Equals(next.Value.Route.Name, activeRoute, StringComparison.OrdinalIgnoreCase))
+                    ImGui.TextColored(new Vector4(1f, .75f, .3f, 1),
+                        $"Next recommendation: {next.Value.Route.Name} for {next.Value.Item.Name} (auto-switches if it remains substantially better)");
+                else ImGui.TextDisabled("The active route remains the best overall choice.");
+            }
+            else if (next != null)
                 ImGui.TextColored(new Vector4(.45f, .85f, 1f, 1),
-                    $"Best overall now: {next.Value.Route.Name} (recalculate when {next.Value.Item.Name} reaches target)");
+                    $"Best overall now: {next.Value.Route.Name} | tracked target: {next.Value.Item.Name}");
             ImGui.TextDisabled("This mode scores all unfinished enabled resources in each route and includes loop length, approach distance, and wasted completed nodes.");
         }
         ImGui.Spacing();

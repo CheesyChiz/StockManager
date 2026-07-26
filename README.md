@@ -76,6 +76,8 @@ The farming priorities intentionally behave differently:
 
 Only enabled, unlocked resources served by at least one compatible imported route participate in completion checks.
 
+While **Best overall route progress** is running, Stock Manager also re-evaluates the active route as stocks change. After at least 45 seconds on the route, it switches only when the same alternative remains substantially better for eight consecutive seconds. The route panel shows the actual active route and tracked target separately from the next recommendation.
+
 In **Stop** mode, a resource is unchecked for the current run as soon as it reaches its target. If it was the current route target, Stock Manager stops that loop and recalculates immediately; no manual restart is required. This is session state only: the saved selection returns on the next start. Raising the target or consuming stock below it during the same run activates the resource again automatically.
 
 ## Stock values and exporting
