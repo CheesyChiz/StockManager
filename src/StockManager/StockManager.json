@@ -5,9 +5,9 @@
   "Description": "Choose Island resources and stock levels, then let Stock Manager select imported Visland routes. Supports route editing and supervised generation, sortable resources, farming priorities, flight and underwater navigation, an Island route map, mount override, stuck recovery, Lifestream, surplus export, run statistics, and /sm commands.",
   "RepoUrl": "https://github.com/CheesyChiz/StockManager",
   "IconUrl": "https://raw.githubusercontent.com/CheesyChiz/StockManager/main/assets/icon.png",
-  "Changelog": "Best overall now re-evaluates an active gathering route and switches when another choice remains substantially better, instead of waiting indefinitely for a low-yield support resource. The route panel now separates the active route from the next recommendation and shows the real tracked target.",
+  "Changelog": "The experimental route generator now has its own saved multi-resource selection, independent from Automation targets. Quickly copy the Automation selection, select every available resource, or clear the list. The per-resource reference now clearly explains its direct-yield criteria and is distinguished from Best overall selection.",
   "InternalName": "StockManager",
-  "AssemblyVersion": "1.7.1.0",
+  "AssemblyVersion": "1.7.2.0",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
   "Tags": ["Island Sanctuary", "Visland", "Automation"]

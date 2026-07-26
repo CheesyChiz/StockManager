@@ -124,7 +124,7 @@ Stock Manager currently recognizes the English interaction names used by the com
 
 ## Experimental route workbench
 
-The **Routes** tab contains the route generator and editor. The generator builds a compact temporary route from gathering nodes already present in imported Visland routes. It covers the checked resources, adds nearby target nodes before distant detours, adds support nodes until the loop has a 12-node respawn safety margin, and orders the result into a short cycle. Nearby hops are marked for walking; longer legs use the selected mount.
+The **Routes** tab contains the route generator and editor. The generator has its own saved multi-resource selection, independent from the farming checkboxes on **Automation**. Use **Use Automation selection** as a shortcut, select every currently available resource, or clear the list and choose one or more materials manually. It builds a compact temporary route from compatible gathering nodes already present in imported Visland routes, adds nearby target nodes before distant detours, adds support nodes until the loop has a 12-node respawn safety margin, and orders the result into a short cycle. Nearby hops are marked for walking; longer legs use the selected mount.
 
 An imported route or generated preview can be saved as an editable Stock Manager route. Its name, waypoint order, coordinates, arrival radii, movement mode, and pathfinding flag can be changed without modifying the original route in Visland. A uniquely named custom route can optionally participate in automatic selection. The editor can add the character's current position or any gathering node known from the imported route collection.
 
