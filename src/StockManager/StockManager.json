@@ -5,9 +5,9 @@
   "Description": "Choose Island resources and stock levels, then let Stock Manager select imported Visland routes. Supports route editing and supervised generation, sortable resources, farming priorities, flight and underwater navigation, an Island route map, mount override, stuck recovery, Lifestream, surplus export, run statistics, and /sm commands.",
   "RepoUrl": "https://github.com/CheesyChiz/StockManager",
   "IconUrl": "https://raw.githubusercontent.com/CheesyChiz/StockManager/main/assets/icon.png",
-  "Changelog": "Added a Routes workbench for editable copies of imported or generated routes, with supervised ground and flight test loops. Improved tight mounted-to-foot transitions such as Rocksalt/Laver. Short routes now prefer useful respawn detours. Export thresholds interrupt an active loop immediately, and surplus farming prioritizes unfinished stock before efficient cowrie routes.",
+  "Changelog": "Best overall now re-evaluates an active gathering route and switches when another choice remains substantially better, instead of waiting indefinitely for a low-yield support resource. The route panel now separates the active route from the next recommendation and shows the real tracked target.",
   "InternalName": "StockManager",
-  "AssemblyVersion": "1.7.0.0",
+  "AssemblyVersion": "1.7.1.0",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
   "Tags": ["Island Sanctuary", "Visland", "Automation"]
