@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.2
+
+- Added a saved multi-resource selector specifically for the experimental route generator.
+- Added shortcuts to copy the Automation selection, select all currently available resources, or clear the generator list.
+- Restricted generator candidates and respawn-support nodes to routes compatible with current flight access.
+- Renamed the per-resource route reference and explained that it compares direct matching-node yield rather than representing the Best overall decision.
+
 ## 1.7.1
 
 - Re-evaluate an active **Best overall route progress** route as resource stocks change.

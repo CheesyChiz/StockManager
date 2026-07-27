@@ -1093,6 +1093,12 @@ public sealed partial class Plugin : IDalamudPlugin
             config.Version = 8;
             changed = true;
         }
+        if (config.Version < 9)
+        {
+            config.GeneratorItems = config.EnabledItems.ToHashSet();
+            config.Version = 9;
+            changed = true;
+        }
         if (changed) Save();
     }
 
@@ -1861,7 +1867,8 @@ public sealed partial class Plugin : IDalamudPlugin
             ImGui.TextDisabled("This mode scores all unfinished enabled resources in each route and includes loop length, approach distance, and wasted completed nodes.");
         }
         ImGui.Spacing();
-        ImGui.TextDisabled("Per-resource route reference:");
+        ImGui.TextDisabled("Highest direct yield by resource (reference only):");
+        ImGui.TextDisabled("This is not the Best overall decision. Matching nodes per loop are compared first; ties prefer routes that also advance other unfinished resources.");
         foreach (var item in UniqueItems(data).Where(x => IsEffectivelyEnabled(x.Id)).OrderBy(x => x.Name))
         {
             var candidates = compatible.Select(route => (Route: route, Item: route.Items.FirstOrDefault(x => x.Id == item.Id)))
@@ -1871,7 +1878,7 @@ public sealed partial class Plugin : IDalamudPlugin
             {
                 var best = candidates[0];
                 ImGui.TextUnformatted($"{item.Name}: {best.Route.Name}");
-                ImGui.TextDisabled($"  best of {candidates.Count}; about {best.Item!.PerLoop} node(s) per loop");
+                ImGui.TextDisabled($"  ~{best.Item!.PerLoop} matching node(s) per loop; {candidates.Count} compatible route(s) contain this resource");
             }
         }
 
@@ -1882,6 +1889,7 @@ public sealed partial class Plugin : IDalamudPlugin
         if (!ImGui.CollapsingHeader("Experimental route generator")) return;
         ImGui.TextWrapped("Builds a compact temporary route from gathering nodes already present in imported Visland routes. Nearby target nodes are added before distant detours.");
         ImGui.TextColored(new Vector4(1f, .75f, .25f, 1), "Experimental: inspect and test the result before relying on it.");
+        DrawGeneratorResourceSelector(data);
         var limit = experimentalNodeLimit; ImGui.SetNextItemWidth(75);
         if (ImGui.InputInt("Maximum nodes", ref limit)) experimentalNodeLimit = Math.Clamp(limit, 12, 30);
         ImGui.TextDisabled("At least 12 unique nodes provide a one-node respawn safety margin; short nearby hops stay on foot.");
@@ -1920,37 +1928,84 @@ public sealed partial class Plugin : IDalamudPlugin
         }
     }
 
+    private void DrawGeneratorResourceSelector(VislandSnapshot data)
+    {
+        var compatible = CompatibleRoutes(data).ToList();
+        var items = compatible.SelectMany(x => x.Items).GroupBy(x => x.Id).Select(x => x.First())
+            .Where(x => x.IsAvailable).OrderBy(x => x.Name).ToList();
+        var selected = items.Where(x => config.GeneratorItems.Contains(x.Id)).ToList();
+        var preview = selected.Count switch
+        {
+            0 => "Select resources...",
+            <= 3 => string.Join(", ", selected.Select(x => x.Name)),
+            _ => $"{selected.Count} resources selected",
+        };
+
+        ImGui.SetNextItemWidth(Math.Min(520, ImGui.GetContentRegionAvail().X));
+        if (ImGui.BeginCombo("Generator resources", preview, ImGuiComboFlags.HeightLarge))
+        {
+            foreach (var item in items)
+            {
+                var enabled = config.GeneratorItems.Contains(item.Id);
+                if (!ImGui.Checkbox($"{item.Name}##generator{item.Id}", ref enabled)) continue;
+                if (enabled) config.GeneratorItems.Add(item.Id);
+                else config.GeneratorItems.Remove(item.Id);
+                Save();
+            }
+            ImGui.EndCombo();
+        }
+
+        if (ImGui.SmallButton("Use Automation selection"))
+        {
+            config.GeneratorItems = items.Where(x => config.EnabledItems.Contains(x.Id)).Select(x => x.Id).ToHashSet();
+            Save();
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Select all available"))
+        {
+            config.GeneratorItems = items.Select(x => x.Id).ToHashSet();
+            Save();
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Clear"))
+        {
+            config.GeneratorItems.Clear();
+            Save();
+        }
+        ImGui.TextDisabled(selected.Count == 0
+            ? "Choose one or more resources specifically for this generated route."
+            : $"The preview will cover: {string.Join(", ", selected.Select(x => x.Name))}.");
+    }
+
     private void GenerateExperimentalRoute(VislandSnapshot data)
     {
         experimentalRoute = null;
         var compatible = CompatibleRoutes(data).ToList();
-        var activeItems = UniqueItems(data)
-            .Where(x => x.IsAvailable && config.EnabledItems.Contains(x.Id) && config.Targets.TryGetValue(x.Id, out var target) && target > 0)
-            .Where(x => compatible.Any(route => route.Items.Any(item => item.Id == x.Id)))
-            .OrderBy(x => (double)x.CurrentCount / Math.Max(1, config.Targets[x.Id])).ToList();
+        var activeItems = compatible.SelectMany(x => x.Items).GroupBy(x => x.Id).Select(x => x.First())
+            .Where(x => x.IsAvailable && config.GeneratorItems.Contains(x.Id))
+            .OrderBy(x => x.Name).ToList();
         if (activeItems.Count == 0)
         {
-            experimentalStatus = "Enable at least one unlocked resource with a compatible route.";
+            experimentalStatus = "Select at least one available generator resource with a compatible route.";
             return;
         }
 
-        var availableIds = UniqueItems(data).Where(x => x.IsAvailable).Select(x => x.Id).ToHashSet();
-        var allNodes = GetKnownNodes(data)
-            .Where(x => data.FlightUnlocked == true || !RouteAccessibility.IsFlightOnlyAltitude(x.Position))
+        var availableIds = compatible.SelectMany(x => x.Items).Where(x => x.IsAvailable).Select(x => x.Id).ToHashSet();
+        var allNodes = compatible.SelectMany(x => x.Nodes)
             .Where(x => x.ItemIds.Any(availableIds.Contains))
             .GroupBy(NodeKey).Select(x => x.First()).ToList();
         var activeIds = activeItems.Select(x => x.Id).ToHashSet();
         var targetNodes = allNodes.Where(x => x.ItemIds.Any(activeIds.Contains)).ToList();
         if (targetNodes.Count == 0)
         {
-            experimentalStatus = "No usable gathering nodes were found for the enabled resources.";
+            experimentalStatus = "No usable gathering nodes were found for the selected generator resources.";
             return;
         }
 
         var selected = SelectClusteredNodes(targetNodes, activeItems, experimentalNodeLimit);
         if (selected.Count == 0)
         {
-            experimentalStatus = $"The selected resources cannot all fit within {experimentalNodeLimit} nodes. Increase Maximum nodes or enable fewer resources.";
+            experimentalStatus = $"The selected resources cannot all fit within {experimentalNodeLimit} nodes. Increase Maximum nodes or select fewer resources.";
             return;
         }
         while (selected.Count < 12)

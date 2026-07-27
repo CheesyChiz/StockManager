@@ -5,7 +5,7 @@ namespace StockManager;
 
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 8;
+    public int Version { get; set; } = 9;
     public bool Enabled { get; set; }
     public bool AutoTravelToIsland { get; set; }
     public uint MountId { get; set; }
@@ -17,6 +17,7 @@ public sealed class Configuration : IPluginConfiguration
     public int ExportBatch { get; set; } = 100;
     public Dictionary<int, int> Targets { get; set; } = new();
     public HashSet<int> EnabledItems { get; set; } = new();
+    public HashSet<int> GeneratorItems { get; set; } = new();
     public List<UserRouteConfiguration> UserRoutes { get; set; } = new();
     [JsonProperty("BulkSellLimit", NullValueHandling = NullValueHandling.Ignore)]
     public int? LegacyBulkSellLimit { get; set; }
