@@ -19,6 +19,7 @@ internal sealed class VislandAdapter
     private readonly ICallGateSubscriber<object> stopRoute;
     private readonly ICallGateSubscriber<bool> navmeshReady;
     private readonly ICallGateSubscriber<Vector3, bool, bool> navmeshMoveTo;
+    private readonly ICallGateSubscriber<List<Vector3>, bool, object> navmeshPathMoveTo;
     private readonly ICallGateSubscriber<bool> navmeshPathfindInProgress;
     private readonly ICallGateSubscriber<bool> navmeshPathRunning;
     private readonly ICallGateSubscriber<object> navmeshStop;
@@ -34,6 +35,7 @@ internal sealed class VislandAdapter
         stopRoute = pluginInterface.GetIpcSubscriber<object>("visland.StopRoute");
         navmeshReady = pluginInterface.GetIpcSubscriber<bool>("vnavmesh.Nav.IsReady");
         navmeshMoveTo = pluginInterface.GetIpcSubscriber<Vector3, bool, bool>("vnavmesh.SimpleMove.PathfindAndMoveTo");
+        navmeshPathMoveTo = pluginInterface.GetIpcSubscriber<List<Vector3>, bool, object>("vnavmesh.Path.MoveTo");
         navmeshPathfindInProgress = pluginInterface.GetIpcSubscriber<bool>("vnavmesh.SimpleMove.PathfindInProgress");
         navmeshPathRunning = pluginInterface.GetIpcSubscriber<bool>("vnavmesh.Path.IsRunning");
         navmeshStop = pluginInterface.GetIpcSubscriber<object>("vnavmesh.Path.Stop");
@@ -147,7 +149,7 @@ internal sealed class VislandAdapter
             {
                 autoExport = exportConfig.TryGetProperty("AutoSell", out var autoSell) && autoSell.GetBoolean();
             }
-            snapshot = new VislandSnapshot(isRouteRunning.InvokeFunc(), autoExport, GetFlightUnlocked(), routes);
+            snapshot = new VislandSnapshot(isRouteRunning.InvokeFunc(), autoExport, GetFlightUnlocked(), GetIslandRank(), routes);
             error = string.Empty;
             return true;
         }
@@ -198,6 +200,26 @@ internal sealed class VislandAdapter
                 throw new InvalidOperationException("vnavmesh is not installed or ready.");
             if (!navmeshMoveTo.InvokeFunc(destination, fly))
                 throw new InvalidOperationException("vnavmesh rejected the pathfinding request.");
+            error = string.Empty;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.GetBaseException().Message;
+            return false;
+        }
+    }
+
+    public bool TryFollowPath(IEnumerable<Vector3> waypoints, bool fly, out string error)
+    {
+        try
+        {
+            var path = waypoints.ToList();
+            if (!IsNavmeshReady || !navmeshPathMoveTo.HasAction)
+                throw new InvalidOperationException("vnavmesh is not installed or ready.");
+            if (path.Count == 0)
+                throw new InvalidOperationException("The navigation path is empty.");
+            navmeshPathMoveTo.InvokeAction(path, fly);
             error = string.Empty;
             return true;
         }
@@ -461,6 +483,12 @@ internal sealed class VislandAdapter
         if (manager == null || !manager->IsPlayerInSanctuary) return null;
         var playerState = PlayerState.Instance();
         return manager->IslandState.CurrentRank >= 10 && playerState != null && playerState->CanFly;
+    }
+
+    private static unsafe int? GetIslandRank()
+    {
+        var manager = MJIManager.Instance();
+        return manager == null || !manager->IsPlayerInSanctuary ? null : manager->IslandState.CurrentRank;
     }
 }
 

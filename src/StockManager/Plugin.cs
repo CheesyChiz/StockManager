@@ -26,9 +26,33 @@ public sealed partial class Plugin : IDalamudPlugin
     private const float IslandMapOffsetX = -175f;
     private const float IslandMapOffsetZ = 138f;
     private const uint ExporterObjectId = 1043464;
+    private const int InitialCaveUnlockRank = 12;
     private static readonly TimeSpan ActiveRebalanceMinimumRuntime = TimeSpan.FromSeconds(45);
     private static readonly TimeSpan ActiveRebalanceStableWindow = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan StrictPriorityReviewInterval = TimeSpan.FromMinutes(10);
     private static readonly Vector3 IslandBaseExterior = new(-268f, 40f, 226f);
+    private static readonly HashSet<int> InitialCaveResourceIds = [39887, 39888, 39889, 39892, 39893];
+    private static readonly Vector3[] UpperCaveApproach =
+    [
+        new(431.19f, 119.40f, -155.07f),
+        new(441.86f, 116.59f, -168.72f),
+        new(446.32f, 113.38f, -180.23f),
+        new(447.38f, 109.97f, -192.81f),
+        new(425.58f, 98.13f, -245.72f),
+    ];
+    private static readonly Vector3[] LowerCaveApproach =
+    [
+        new(427.57f, 123.13f, -139.80f),
+        new(447.67f, 114.02f, -181.11f),
+        new(449.16f, 112.46f, -187.92f),
+        new(446.81f, 109.99f, -192.11f),
+        new(433.62f, 104.67f, -211.35f),
+        new(386.96f, 99.62f, -233.22f),
+        new(346.98f, 95.59f, -243.23f),
+        new(329.04f, 94.80f, -250.19f),
+        new(317.08f, 91.65f, -256.45f),
+        new(295.24f, 75.50f, -253.14f),
+    ];
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly Services services;
     private readonly Configuration config;
@@ -87,6 +111,7 @@ public sealed partial class Plugin : IDalamudPlugin
     private int activeLastInventoryTotal;
     private DateTime activeLastProgressAt = DateTime.MinValue;
     private DateTime activeRouteStartedAt = DateTime.MinValue;
+    private DateTime nextStrictPriorityReviewAt = DateTime.MinValue;
     private string? activeRebalanceCandidate;
     private DateTime activeRebalanceCandidateSince = DateTime.MinValue;
 
@@ -381,6 +406,7 @@ public sealed partial class Plugin : IDalamudPlugin
         pendingRouteStart = null;
         experimentalTestRunning = false;
         nextStartAttempt = DateTime.MinValue;
+        nextStrictPriorityReviewAt = DateTime.MinValue;
         BeginSession(snapshot);
         Save();
         status = snapshot.FlightUnlocked == null && config.AutoTravelToIsland
@@ -429,22 +455,32 @@ public sealed partial class Plugin : IDalamudPlugin
             if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
             return false;
         }
+        if (IsInitialCaveRoute(route) && snapshot?.IslandRank is { } rank && rank < InitialCaveUnlockRank)
+        {
+            status = $"{route.Name} is inside the cave unlocked at Island rank {InitialCaveUnlockRank}.";
+            if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            return false;
+        }
 
         var nearest = route.Waypoints.Select((waypoint, index) => (Waypoint: waypoint, Index: index,
                 Distance: Vector3.Distance(player.Position, waypoint.Position)))
             .OrderBy(x => x.Distance).First();
         var startIndex = purpose == PendingRoutePurpose.Export ? 0 : nearest.Distance <= 35f ? nearest.Index : 0;
         pendingRouteStart = new PendingRouteStart(route, item?.Id, item?.Name, itemGoal, purpose, startIndex);
+        pendingRouteStart.CaveApproach = IsInitialCaveRoute(route) && !IsInsideInitialCave(player.Position);
         navigationStartedAt = DateTime.UtcNow;
         navigationRequestedAt = DateTime.MinValue;
         nextMountAttempt = DateTime.MinValue;
         nextDiveAttempt = DateTime.MinValue;
         activeRoute = route.Name;
-        var startDistance = Vector3.Distance(player.Position, route.Waypoints[startIndex].Position);
+        var startTarget = pendingRouteStart.CaveApproach ? GetCaveApproach(route)[0] : route.Waypoints[startIndex].Position;
+        var startDistance = Vector3.Distance(player.Position, startTarget);
         pendingRouteStart.UseIsleReturn = purpose == PendingRoutePurpose.Export && startDistance > 35f;
         pendingRouteStart.LastProgressDistance = startDistance;
         pendingRouteStart.LastProgressAt = DateTime.UtcNow;
-        status = purpose != PendingRoutePurpose.Export && nearest.Distance <= 35f
+        status = pendingRouteStart.CaveApproach
+            ? $"Preparing a guided vnavmesh approach through the cave entrance for {route.Name}..."
+            : purpose != PendingRoutePurpose.Export && nearest.Distance <= 35f
             ? $"Starting {route.Name} from nearby waypoint #{startIndex + 1}..."
             : $"Preparing a direct vnavmesh route to {route.Name}...";
         if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
@@ -589,7 +625,7 @@ public sealed partial class Plugin : IDalamudPlugin
             return;
         }
 
-        var requiresMount = diving || distance > 12f || waypoint.Movement != RouteMovement.Normal;
+        var requiresMount = pending.CaveApproach || diving || distance > 12f || waypoint.Movement != RouteMovement.Normal;
         if (requiresMount && !services.Condition[ConditionFlag.Mounted] && (!inWater || diving))
         {
             pending.NavigationRequested = false;
@@ -632,6 +668,8 @@ public sealed partial class Plugin : IDalamudPlugin
             pending.LastProgressDistance = progressDistance;
         }
         pending.MountStartedAt = null;
+
+        if (HandleInitialCaveApproach(data, pending, player.Position)) return;
 
         if (!pending.NavigationRequested)
         {
@@ -685,6 +723,84 @@ public sealed partial class Plugin : IDalamudPlugin
         HandleStuckRoute(pending, "vnavmesh stopped before reaching the route");
     }
 
+    private bool HandleInitialCaveApproach(VislandSnapshot data, PendingRouteStart pending, Vector3 playerPosition)
+    {
+        if (!pending.CaveApproach) return false;
+        if (data.FlightUnlocked != true)
+        {
+            HandleStuckRoute(pending, "the cave approach requires Island flight");
+            return true;
+        }
+
+        var path = GetCaveApproach(pending.Route);
+        var target = pending.CaveApproachStage == 0 ? path[0] : path[^1];
+        var distance = Vector3.Distance(playerPosition, target);
+        if (!pending.CaveNavigationInitialized)
+        {
+            adapter.StopNavigation();
+            pending.NavigationRequested = false;
+            pending.CaveNavigationInitialized = true;
+            pending.LastProgressDistance = distance;
+            pending.LastProgressAt = DateTime.UtcNow;
+        }
+
+        var arrivalRadius = pending.CaveApproachStage == 0 ? 10f : 8f;
+        if (distance <= arrivalRadius)
+        {
+            adapter.StopNavigation();
+            pending.NavigationRequested = false;
+            pending.LastProgressAt = DateTime.UtcNow;
+            if (pending.CaveApproachStage == 0)
+            {
+                pending.CaveApproachStage = 1;
+                pending.CaveNavigationInitialized = false;
+                status = $"Reached the cave entrance; following the guided corridor to {pending.Route.Name}...";
+                if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+                return true;
+            }
+
+            pending.CaveApproach = false;
+            StartPreparedRoute(pending);
+            return true;
+        }
+
+        if (!pending.NavigationRequested)
+        {
+            var started = pending.CaveApproachStage == 0
+                ? adapter.TryNavigateTo(target, true, out var error)
+                : adapter.TryFollowPath(path.Skip(1), true, out error);
+            if (!started)
+            {
+                HandleStuckRoute(pending, $"the guided cave approach could not start: {error}");
+                return true;
+            }
+            pending.NavigationRequested = true;
+            pending.NavigationWasThreeDimensional = true;
+            navigationRequestedAt = DateTime.UtcNow;
+        }
+
+        if (distance + 1.5f < pending.LastProgressDistance)
+        {
+            pending.LastProgressDistance = distance;
+            pending.LastProgressAt = DateTime.UtcNow;
+        }
+        else if (config.SkipStuckRoutes
+                 && DateTime.UtcNow - pending.LastProgressAt > TimeSpan.FromSeconds(Math.Clamp(config.StuckTimeoutSeconds, 8, 60)))
+        {
+            HandleStuckRoute(pending,
+                "the cave entrance made no progress; make sure the rank 12 cave expansion and Mammet-sized Spelunking Tools are complete");
+            return true;
+        }
+
+        status = pending.CaveApproachStage == 0
+            ? $"Flying to the cave entrance for {pending.Route.Name}... ({distance:F0} yalms)"
+            : $"Following the guided cave corridor to {pending.Route.Name}... ({distance:F0} yalms)";
+        if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+        if (DateTime.UtcNow - navigationRequestedAt >= TimeSpan.FromSeconds(2) && !adapter.IsNavigationBusy)
+            pending.NavigationRequested = false;
+        return true;
+    }
+
     private void StartPreparedRoute(PendingRouteStart pending)
     {
         adapter.StopNavigation();
@@ -725,6 +841,7 @@ public sealed partial class Plugin : IDalamudPlugin
                 activeTargetGoal = pending.ItemGoal;
                 lastFarmRoute = pending.Route.Name;
                 activeRouteStartedAt = DateTime.UtcNow;
+                nextStrictPriorityReviewAt = DateTime.UtcNow + StrictPriorityReviewInterval;
                 activeRebalanceCandidate = null;
                 activeRebalanceCandidateSince = DateTime.MinValue;
                 activeLastPosition = services.Objects.LocalPlayer?.Position;
@@ -759,12 +876,53 @@ public sealed partial class Plugin : IDalamudPlugin
 
     private bool HandleActiveRouteRebalance(VislandSnapshot data)
     {
-        if (config.ResourcePriority != ResourcePriority.FastestRoute
-            || activeRoute == null
+        if (activeRoute == null
             || exportTrip
             || activeDiveStartedAt != null
-            || activeRouteStartedAt == DateTime.MinValue
-            || DateTime.UtcNow - activeRouteStartedAt < ActiveRebalanceMinimumRuntime)
+            || activeRouteStartedAt == DateTime.MinValue)
+        {
+            ResetActiveRebalanceCandidate();
+            return false;
+        }
+
+        if (config.ResourcePriority != ResourcePriority.FastestRoute)
+        {
+            if (DateTime.UtcNow < nextStrictPriorityReviewAt) return false;
+            nextStrictPriorityReviewAt = DateTime.UtcNow + StrictPriorityReviewInterval;
+            var strictRecommendation = SelectPhaseRoute(data);
+            if (strictRecommendation == null)
+            {
+                var previous = activeRoute;
+                adapter.Stop();
+                activeRoute = null;
+                ClearActiveTargetTracking();
+                nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
+                status = $"Stopped {previous}: the 10-minute strict-priority review found no unfinished compatible target.";
+                return true;
+            }
+
+            if (string.Equals(strictRecommendation.Value.Route.Name, activeRoute, StringComparison.OrdinalIgnoreCase))
+            {
+                if (activeTargetItemId != strictRecommendation.Value.Item.Id)
+                {
+                    activeTargetItemId = strictRecommendation.Value.Item.Id;
+                    activeTargetItemName = strictRecommendation.Value.Item.Name;
+                    activeTargetGoal = SelectionGoal(data, strictRecommendation.Value.Item);
+                    status = $"10-minute priority review kept {activeRoute} and now tracks {activeTargetItemName}.";
+                }
+                return false;
+            }
+
+            var strictPreviousRoute = activeRoute;
+            adapter.Stop();
+            activeRoute = null;
+            ClearActiveTargetTracking();
+            nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
+            status = $"10-minute priority review changed {strictPreviousRoute} to {strictRecommendation.Value.Route.Name} for {strictRecommendation.Value.Item.Name}.";
+            return true;
+        }
+
+        if (DateTime.UtcNow - activeRouteStartedAt < ActiveRebalanceMinimumRuntime)
         {
             ResetActiveRebalanceCandidate();
             return false;
@@ -796,6 +954,21 @@ public sealed partial class Plugin : IDalamudPlugin
         nextStartAttempt = DateTime.UtcNow.AddSeconds(1);
         status = $"Stopped {previousRoute}: {nextRoute} remained substantially better; recalculating.";
         return true;
+    }
+
+    private int SelectionGoal(VislandSnapshot data, ItemSnapshot item)
+    {
+        var target = config.Targets.GetValueOrDefault(item.Id, 1);
+        var unfinishedTargetsRemain = ManagedItems(data).Any(x => x.IsAvailable && x.CurrentCount < config.Targets[x.Id]);
+        return config.CompletionAction == CompletionAction.FarmAndExport && !unfinishedTargetsRemain
+            ? ExportTrigger(item.Id)
+            : target;
+    }
+
+    private void RequestRouteRecalculation()
+    {
+        nextStrictPriorityReviewAt = DateTime.MinValue;
+        ResetActiveRebalanceCandidate();
     }
 
     private void ResetActiveRebalanceCandidate()
@@ -1121,13 +1294,21 @@ public sealed partial class Plugin : IDalamudPlugin
         var routes = SelectableRoutes(data);
         var candidates = ManagedItems(data).Where(x => x.IsAvailable)
             .Where(x => config.Targets[x.Id] > x.CurrentCount).ToList();
-        if (preferRespawnDetour) routes = PreferRespawnDetour(routes, candidates);
         if (config.ResourcePriority == ResourcePriority.FastestRoute)
+        {
+            if (preferRespawnDetour) routes = PreferRespawnDetour(routes, candidates);
             return SelectBestProgressRoute(routes, candidates, x => config.Targets[x.Id]);
+        }
+
+        // Strict priorities decide which resource wins before respawn protection is considered. Applying the
+        // detour globally here could remove every route for the lowest-stock item and silently fall through to a
+        // different resource. A detour may only choose between routes that still gather the selected item.
         var items = OrderItems(data, candidates, x => config.Targets[x.Id], routes);
         foreach (var item in items)
         {
-            var route = routes
+            var itemRoutes = routes.Where(x => x.Items.Any(y => y.Id == item.Id && y.PerLoop > 0)).ToList();
+            if (preferRespawnDetour) itemRoutes = PreferRespawnDetour(itemRoutes, [item]);
+            var route = itemRoutes
                 .Select(x => (Route: x, Item: x.Items.FirstOrDefault(y => y.Id == item.Id)))
                 .Where(x => x.Item is { PerLoop: > 0 }).OrderByDescending(x => x.Item!.PerLoop)
                 .ThenByDescending(x => RouteUtility(x.Route)).FirstOrDefault();
@@ -1284,7 +1465,22 @@ public sealed partial class Plugin : IDalamudPlugin
 
     private IEnumerable<RouteSnapshot> CompatibleRoutes(VislandSnapshot data) => data.Routes
         .Concat(GetUserRouteSnapshots(data, true))
-        .Where(x => data.FlightUnlocked == true || !x.RequiresFlying);
+        .Where(x => data.FlightUnlocked == true || !x.RequiresFlying)
+        .Where(x => !IsInitialCaveRoute(x)
+                    || data.FlightUnlocked == true && (data.IslandRank == null || data.IslandRank >= InitialCaveUnlockRank));
+
+    private static bool IsInitialCaveRoute(RouteSnapshot route) =>
+        route.Items.Any(x => InitialCaveResourceIds.Contains(x.Id));
+
+    private static bool IsLowerInitialCaveRoute(RouteSnapshot route) =>
+        route.Items.Any(x => x.Id is 39892 or 39893)
+        || route.Nodes.Any(x => x.ObjectName.Equals("stalagmite", StringComparison.OrdinalIgnoreCase));
+
+    private static IReadOnlyList<Vector3> GetCaveApproach(RouteSnapshot route) =>
+        IsLowerInitialCaveRoute(route) ? LowerCaveApproach : UpperCaveApproach;
+
+    private static bool IsInsideInitialCave(Vector3 position) =>
+        position.X is >= 270f and <= 510f && position.Z <= -225f && position.Y <= 112f;
 
     private List<RouteSnapshot> SelectableRoutes(VislandSnapshot data)
     {
@@ -1661,9 +1857,10 @@ public sealed partial class Plugin : IDalamudPlugin
         var priority = (int)config.ResourcePriority;
         ImGui.SetNextItemWidth(Math.Min(420, ImGui.GetContentRegionAvail().X));
         if (ImGui.Combo("##ResourcePriority", ref priority,
-                "Largest relative deficit (strict)\0Lowest current stock\0Highest current stock\0Best overall route progress (recommended)\0"))
+                "Largest relative deficit (strict)\0Lowest current stock (strict)\0Highest current stock (strict)\0Best overall route progress (recommended)\0"))
         {
             config.ResourcePriority = (ResourcePriority)priority;
+            RequestRouteRecalculation();
             Save();
         }
         ImGui.TextDisabled(config.ResourcePriority switch
@@ -1673,6 +1870,9 @@ public sealed partial class Plugin : IDalamudPlugin
             ResourcePriority.FastestRoute => "Balances useful unfinished resources per loop against route length, approach distance, and already-complete nodes.",
             _ => "Strictly farms the largest current/target deficit first, even when its compatible route has a low yield.",
         });
+        ImGui.TextDisabled(config.ResourcePriority == ResourcePriority.FastestRoute
+            ? "Best overall is reviewed continuously after the route has run for 45 seconds; a better choice must remain stable before switching."
+            : "Strict modes keep the chosen target, then review priorities every 10 minutes, when it reaches its target, or immediately after settings change.");
 
         ImGui.Spacing();
         ImGui.TextUnformatted("Stuck recovery");
@@ -1718,18 +1918,28 @@ public sealed partial class Plugin : IDalamudPlugin
                     completedStopItems.Remove(id);
                 }
             }
+            RequestRouteRecalculation();
             Save();
         }
         var maximumTarget = config.CompletionAction == CompletionAction.FarmAndExport ? Math.Max(1, 999 - config.ExportBatch) : 999;
         var bulk = config.BulkTarget; ImGui.SetNextItemWidth(75);
         if (ImGui.InputInt($"{targetLabel} for all", ref bulk)) { config.BulkTarget = Math.Clamp(bulk, 1, maximumTarget); Save(); }
         ImGui.SameLine(); if (ImGui.Button("Apply##farm"))
-        { foreach (var id in config.Targets.Keys.ToList()) config.Targets[id] = Math.Min(config.BulkTarget, maximumTarget); Save(); }
+        {
+            foreach (var id in config.Targets.Keys.ToList()) config.Targets[id] = Math.Min(config.BulkTarget, maximumTarget);
+            RequestRouteRecalculation();
+            Save();
+        }
         if (config.CompletionAction == CompletionAction.FarmAndExport)
         {
             ImGui.SameLine(); var batch = config.ExportBatch; ImGui.SetNextItemWidth(75);
             var highestTarget = config.EnabledItems.Select(id => config.Targets.GetValueOrDefault(id, 1)).DefaultIfEmpty(1).Max();
-            if (ImGui.InputInt("Export batch", ref batch)) { config.ExportBatch = Math.Clamp(batch, 1, Math.Max(1, 999 - highestTarget)); Save(); }
+            if (ImGui.InputInt("Export batch", ref batch))
+            {
+                config.ExportBatch = Math.Clamp(batch, 1, Math.Max(1, 999 - highestTarget));
+                RequestRouteRecalculation();
+                Save();
+            }
             ImGui.TextDisabled("Visit at Sell above + batch; export back down to Sell above.");
             if (TryGetExportValidationError(data, out var error)) ImGui.TextColored(new Vector4(1f, .3f, .3f, 1), error);
         }
@@ -1780,18 +1990,25 @@ public sealed partial class Plugin : IDalamudPlugin
                     config.EnabledItems.Remove(item.Id);
                     completedStopItems.Remove(item.Id);
                 }
+                RequestRouteRecalculation();
                 Save();
             }
             if (!canFarm) ImGui.EndDisabled();
             ImGui.SameLine();
             if (!item.IsAvailable) ImGui.TextDisabled($"{item.Name} (tool locked)");
-            else if (!hasCompatibleRoute) ImGui.TextDisabled($"{item.Name} (flight unavailable)");
+            else if (InitialCaveResourceIds.Contains(item.Id) && data.IslandRank is < InitialCaveUnlockRank)
+                ImGui.TextDisabled($"{item.Name} (cave unlocks at rank {InitialCaveUnlockRank})");
+            else if (!hasCompatibleRoute) ImGui.TextDisabled($"{item.Name} (access unavailable)");
             else ImGui.TextUnformatted(item.Name);
             ImGui.TableNextColumn(); ImGui.TextUnformatted(item.CurrentCount.ToString());
             ImGui.TableNextColumn(); var target = config.Targets[item.Id]; ImGui.SetNextItemWidth(65);
             if (!item.IsAvailable) ImGui.BeginDisabled();
             if (ImGui.InputInt($"##target{item.Id}", ref target))
-            { config.Targets[item.Id] = Math.Clamp(target, 1, maximumTarget); Save(); }
+            {
+                config.Targets[item.Id] = Math.Clamp(target, 1, maximumTarget);
+                RequestRouteRecalculation();
+                Save();
+            }
             if (!item.IsAvailable) ImGui.EndDisabled();
             ImGui.TableNextColumn();
             ImGui.TextUnformatted(!canFarm ? "ignored" : completedForRun ? "done" : !enabled ? "off" : item.CurrentCount >= target ? "done" : $"{item.CurrentCount * 100 / target}%");
@@ -1814,6 +2031,7 @@ public sealed partial class Plugin : IDalamudPlugin
         {
             config.CompletionAction = (CompletionAction)completion;
             if (config.CompletionAction == CompletionAction.FarmAndExport) NormalizeExportLimits();
+            RequestRouteRecalculation();
             Save();
         }
         var autoTravel = config.AutoTravelToIsland;
@@ -1843,6 +2061,10 @@ public sealed partial class Plugin : IDalamudPlugin
         if (data.FlightUnlocked == true) ImGui.TextDisabled("Island flight is unlocked; ground and flying routes are available.");
         else if (data.FlightUnlocked == false) ImGui.TextDisabled("Island flight is locked; flying routes and their exclusive resources are ignored.");
         else ImGui.TextDisabled("Travel to your Island to detect flight access; only ground routes are available until then.");
+        if (data.IslandRank is < InitialCaveUnlockRank)
+            ImGui.TextDisabled($"Rank {InitialCaveUnlockRank} cave routes and their exclusive resources are ignored until the cave expansion is available.");
+        else if (data.IslandRank >= InitialCaveUnlockRank)
+            ImGui.TextDisabled("Cave routes use a guided flight through the entrance before Visland starts the gathering loop.");
         ImGui.TextDisabled($"Considering {compatible.Count} of {data.Routes.Count} imported Island routes.");
         if (config.ResourcePriority == ResourcePriority.FastestRoute)
         {
@@ -1865,6 +2087,21 @@ public sealed partial class Plugin : IDalamudPlugin
                 ImGui.TextColored(new Vector4(.45f, .85f, 1f, 1),
                     $"Best overall now: {next.Value.Route.Name} | tracked target: {next.Value.Item.Name}");
             ImGui.TextDisabled("This mode scores all unfinished enabled resources in each route and includes loop length, approach distance, and wasted completed nodes.");
+        }
+        else
+        {
+            var next = SelectPhaseRoute(data);
+            if (next != null)
+                ImGui.TextColored(new Vector4(.45f, .85f, 1f, 1),
+                    $"Strict-priority choice now: {next.Value.Item.Name} via {next.Value.Route.Name}");
+            if (data.IsRunning && activeRoute != null && activeTargetItemName != null)
+            {
+                var reviewIn = nextStrictPriorityReviewAt <= DateTime.UtcNow
+                    ? "now"
+                    : $"{Math.Max(1, (int)Math.Ceiling((nextStrictPriorityReviewAt - DateTime.UtcNow).TotalMinutes))} min";
+                ImGui.TextDisabled($"Active strict target: {activeTargetItemName} via {activeRoute}; next scheduled review: {reviewIn}.");
+            }
+            ImGui.TextDisabled("Strict modes choose the resource first. Respawn detours may change its route, but never replace it with another resource.");
         }
         ImGui.Spacing();
         ImGui.TextDisabled("Highest direct yield by resource (reference only):");
@@ -2340,6 +2577,9 @@ public sealed partial class Plugin : IDalamudPlugin
         public bool UseIsleReturn { get; set; }
         public DateTime? IsleReturnStartedAt { get; set; }
         public bool ExitingCabin { get; set; }
+        public bool CaveApproach { get; set; }
+        public int CaveApproachStage { get; set; }
+        public bool CaveNavigationInitialized { get; set; }
     }
 
     private sealed record MountOption(uint Id, string Name);

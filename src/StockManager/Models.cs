@@ -7,6 +7,7 @@ public sealed record VislandSnapshot(
     [property: JsonPropertyName("IsRunning")] bool IsRunning,
     [property: JsonPropertyName("AutoExportEnabled")] bool AutoExportEnabled,
     [property: JsonPropertyName("FlightUnlocked")] bool? FlightUnlocked,
+    [property: JsonIgnore] int? IslandRank,
     [property: JsonPropertyName("Routes")] List<RouteSnapshot> Routes);
 
 public sealed record RouteSnapshot(

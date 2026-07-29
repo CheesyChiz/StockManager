@@ -8,7 +8,7 @@
   Automatic Island Sanctuary stock balancing with routes imported into Visland.
 </p>
 
-Stock Manager keeps selected gathering resources at your chosen levels. It runs one Visland route at a time, watches Island inventory while the route is active, and recalculates as soon as the current target is reached.
+Stock Manager keeps selected gathering resources at your chosen levels. It runs one Visland route at a time, watches Island inventory while the route is active, and recalculates when the current target is reached or its selected priority is due for review.
 
 ## Features
 
@@ -20,6 +20,7 @@ Stock Manager keeps selected gathering resources at your chosen levels. It runs 
 - Uses vnavmesh to travel from the character's current position before handing control to Visland.
 - Offers mount roulette and every unlocked mount in one dropdown; a specific selection also replaces Visland's roulette during Stock Manager routes.
 - Detects Island flight at Sanctuary Rank 10 and excludes flight-only routes and high-altitude nodes while it is locked.
+- Detects the initial cave unlock at Sanctuary Rank 12 and uses a guided vnavmesh approach through its entrance instead of navigating directly toward underground gathering coordinates.
 - Enters water, dives, rebuilds navigation in 3D, and mounts underwater when an imported route requires it.
 - Can temporarily skip an approach or active route that makes no movement or gathering progress and try another route or resource.
 - Uses the game's item/tool availability flags and ignores unavailable resources automatically.
@@ -72,11 +73,13 @@ The farming priorities intentionally behave differently:
 
 - **Largest relative deficit (strict)** selects the resource with the lowest `current / target` ratio first. It may keep choosing a long route that contains only one or two matching nodes when that resource is far behind.
 - **Best overall route progress** scores every compatible route using all enabled unfinished resources it can advance. It also considers useful node yield, remaining deficits, already-complete nodes, estimated loop length, and the approach from the character's current position. To prevent long-distance ping-pong, it keeps the current area while its route remains within 80% of the best score.
-- **Lowest current stock** and **Highest current stock** compare raw inventory counts.
+- **Lowest current stock** and **Highest current stock** compare raw inventory counts. Like relative deficit, they are strict resource-first modes.
 
 Only enabled, unlocked resources served by at least one compatible imported route participate in completion checks.
 
 While **Best overall route progress** is running, Stock Manager also re-evaluates the active route as stocks change. After at least 45 seconds on the route, it switches only when the same alternative remains substantially better for eight consecutive seconds. The route panel shows the actual active route and tracked target separately from the next recommendation.
+
+Strict modes choose the winning resource before applying short-route respawn detours, so a detour can change the route but cannot silently replace the selected resource. The active choice is reviewed every 10 minutes, immediately when its target is reached, and immediately after relevant settings change. The route panel shows both the current strict winner and the time until the next scheduled review.
 
 In **Stop** mode, a resource is unchecked for the current run as soon as it reaches its target. If it was the current route target, Stock Manager stops that loop and recalculates immediately; no manual restart is required. This is session state only: the saved selection returns on the next start. Raising the target or consuming stock below it during the same run activates the resource again automatically.
 
@@ -114,6 +117,7 @@ For a distant export trip, Stock Manager uses the Island's **Isle Return** actio
 - When the character is already within 35 yalms of a route, the closest waypoint becomes the start of that loop. Otherwise Stock Manager approaches the route's original first waypoint.
 - While on the Island, Sanctuary Rank 10 and the game's flight-access flag are checked together.
 - If flight is locked, routes named as flying routes, routes containing high-altitude-only nodes, and surface routes that require `MountFly` are ignored. Mixed surface/underwater routes remain usable and their surface transfer is downgraded to ground-mounted movement.
+- Coal, Shale, Glimshroom, Effervescent Water, and Spectrine routes are ignored before the rank 12 cave expansion. Once available, Stock Manager first pathfinds to the cave entrance and then follows a short guided flight corridor inside before starting the imported Visland loop. If the entrance is still physically closed, complete the rank 12 cave expansion and Mammet-sized Spelunking Tools; the plugin reports this instead of repeatedly flying into the wall.
 - Underwater route approaches keep swimming on the surface until diving is possible, then dismount, dive, mount underwater, and ask vnavmesh for a 3D path. A manual dive is detected and causes the same mounted repath. Once Visland starts the route, Stock Manager no longer interrupts its active underwater path.
 - Optional stuck recovery measures both movement and inventory progress during the approach and active gathering loop. After the configured timeout, the route cools down for five minutes and another eligible choice is made. The supported timeout range is 8-60 seconds; a lower value would commonly fire during normal pathfinding, mounting, or gathering animations.
 - Empty on-foot transition waypoints immediately after mounted travel receive a small temporary arrival radius. This lets Visland dismount before tight shoreline or cave geometry without changing gathering-node interaction radii.
