@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.4
+
+- Added a guided reverse flight through the initial cave corridor before switching to an outdoor route.
+- Reuse the correct upper or lower cave corridor based on the route that was just gathered.
+- Fall back to Isle Return when the guided cave exit cannot start or stops making progress, preventing unattended automation from repeatedly flying into a wall.
+
 ## 1.7.3
 
 - Fixed strict farming priorities falling through to a different resource when the previous short route needed a respawn detour.

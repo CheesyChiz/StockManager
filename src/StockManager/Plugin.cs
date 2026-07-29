@@ -467,22 +467,32 @@ public sealed partial class Plugin : IDalamudPlugin
             .OrderBy(x => x.Distance).First();
         var startIndex = purpose == PendingRoutePurpose.Export ? 0 : nearest.Distance <= 35f ? nearest.Index : 0;
         pendingRouteStart = new PendingRouteStart(route, item?.Id, item?.Name, itemGoal, purpose, startIndex);
-        pendingRouteStart.CaveApproach = IsInitialCaveRoute(route) && !IsInsideInitialCave(player.Position);
+        var playerIsInsideCave = IsInsideInitialCave(player.Position);
+        pendingRouteStart.CaveApproach = IsInitialCaveRoute(route) && !playerIsInsideCave;
+        pendingRouteStart.CaveExit = !IsInitialCaveRoute(route) && playerIsInsideCave;
+        if (pendingRouteStart.CaveExit)
+            pendingRouteStart.CaveTransitionPath = GetCaveExitApproach(player.Position);
         navigationStartedAt = DateTime.UtcNow;
         navigationRequestedAt = DateTime.MinValue;
         nextMountAttempt = DateTime.MinValue;
         nextDiveAttempt = DateTime.MinValue;
         activeRoute = route.Name;
-        var startTarget = pendingRouteStart.CaveApproach ? GetCaveApproach(route)[0] : route.Waypoints[startIndex].Position;
+        var startTarget = pendingRouteStart.CaveApproach
+            ? GetCaveApproach(route)[0]
+            : pendingRouteStart.CaveExit
+                ? pendingRouteStart.CaveTransitionPath![^1]
+                : route.Waypoints[startIndex].Position;
         var startDistance = Vector3.Distance(player.Position, startTarget);
         pendingRouteStart.UseIsleReturn = purpose == PendingRoutePurpose.Export && startDistance > 35f;
         pendingRouteStart.LastProgressDistance = startDistance;
         pendingRouteStart.LastProgressAt = DateTime.UtcNow;
         status = pendingRouteStart.CaveApproach
             ? $"Preparing a guided vnavmesh approach through the cave entrance for {route.Name}..."
-            : purpose != PendingRoutePurpose.Export && nearest.Distance <= 35f
-            ? $"Starting {route.Name} from nearby waypoint #{startIndex + 1}..."
-            : $"Preparing a direct vnavmesh route to {route.Name}...";
+            : pendingRouteStart.CaveExit
+                ? $"Preparing a guided flight out of the cave before starting {route.Name}..."
+                : purpose != PendingRoutePurpose.Export && nearest.Distance <= 35f
+                    ? $"Starting {route.Name} from nearby waypoint #{startIndex + 1}..."
+                    : $"Preparing a direct vnavmesh route to {route.Name}...";
         if (purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
         return true;
     }
@@ -519,13 +529,16 @@ public sealed partial class Plugin : IDalamudPlugin
             return;
         }
 
-        if (pending.Purpose == PendingRoutePurpose.Export && pending.UseIsleReturn)
+        if (pending.UseIsleReturn)
         {
             var baseDistance = Vector3.Distance(player.Position, IslandBaseExterior);
             if (baseDistance <= 12f)
             {
                 pending.UseIsleReturn = false;
-                pending.LastProgressDistance = baseDistance;
+                pending.CaveExit = false;
+                pending.CaveNavigationInitialized = false;
+                pending.NavigationRequested = false;
+                pending.LastProgressDistance = float.MaxValue;
                 pending.LastProgressAt = DateTime.UtcNow;
             }
             else if (pending.IsleReturnStartedAt == null
@@ -539,7 +552,9 @@ public sealed partial class Plugin : IDalamudPlugin
                     TryUseIsleReturn();
                     nextIsleReturnAttempt = DateTime.UtcNow.AddSeconds(2);
                 }
-                status = "Using Isle Return before visiting the Island exporter...";
+                status = pending.Purpose == PendingRoutePurpose.Export
+                    ? "Using Isle Return before visiting the Island exporter..."
+                    : $"The guided cave exit stalled; using Isle Return before starting {pending.Route.Name}...";
                 return;
             }
             else
@@ -547,7 +562,11 @@ public sealed partial class Plugin : IDalamudPlugin
                 pending.UseIsleReturn = false;
                 pending.LastProgressAt = DateTime.UtcNow;
                 pending.LastProgressDistance = baseDistance;
-                status = "Isle Return was unavailable; falling back to vnavmesh.";
+                pending.CaveNavigationInitialized = false;
+                pending.NavigationRequested = false;
+                status = pending.CaveExit
+                    ? "Isle Return was unavailable; retrying the guided cave exit."
+                    : "Isle Return was unavailable; falling back to vnavmesh.";
             }
         }
 
@@ -625,7 +644,7 @@ public sealed partial class Plugin : IDalamudPlugin
             return;
         }
 
-        var requiresMount = pending.CaveApproach || diving || distance > 12f || waypoint.Movement != RouteMovement.Normal;
+        var requiresMount = pending.CaveApproach || pending.CaveExit || diving || distance > 12f || waypoint.Movement != RouteMovement.Normal;
         if (requiresMount && !services.Condition[ConditionFlag.Mounted] && (!inWater || diving))
         {
             pending.NavigationRequested = false;
@@ -669,6 +688,7 @@ public sealed partial class Plugin : IDalamudPlugin
         }
         pending.MountStartedAt = null;
 
+        if (HandleInitialCaveExit(data, pending, player.Position)) return;
         if (HandleInitialCaveApproach(data, pending, player.Position)) return;
 
         if (!pending.NavigationRequested)
@@ -799,6 +819,100 @@ public sealed partial class Plugin : IDalamudPlugin
         if (DateTime.UtcNow - navigationRequestedAt >= TimeSpan.FromSeconds(2) && !adapter.IsNavigationBusy)
             pending.NavigationRequested = false;
         return true;
+    }
+
+    private bool HandleInitialCaveExit(VislandSnapshot data, PendingRouteStart pending, Vector3 playerPosition)
+    {
+        if (!pending.CaveExit) return false;
+        if (data.FlightUnlocked != true)
+        {
+            HandleStuckRoute(pending, "the cave exit requires Island flight");
+            return true;
+        }
+
+        var path = pending.CaveTransitionPath ?? GetCaveExitApproach(playerPosition);
+        pending.CaveTransitionPath = path;
+        var target = pending.CaveApproachStage == 0 ? path[^1] : path[0];
+        var distance = Vector3.Distance(playerPosition, target);
+        if (!pending.CaveNavigationInitialized)
+        {
+            adapter.StopNavigation();
+            pending.NavigationRequested = false;
+            pending.CaveNavigationInitialized = true;
+            pending.LastProgressDistance = distance;
+            pending.LastProgressAt = DateTime.UtcNow;
+        }
+
+        var arrivalRadius = pending.CaveApproachStage == 0 ? 8f : 10f;
+        if (distance <= arrivalRadius)
+        {
+            adapter.StopNavigation();
+            pending.NavigationRequested = false;
+            pending.LastProgressAt = DateTime.UtcNow;
+            if (pending.CaveApproachStage == 0)
+            {
+                pending.CaveApproachStage = 1;
+                pending.CaveNavigationInitialized = false;
+                status = $"Reached the inner cave corridor; following the guided exit before {pending.Route.Name}...";
+                if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+                return true;
+            }
+
+            pending.CaveExit = false;
+            pending.CaveNavigationInitialized = false;
+            pending.LastProgressDistance = Vector3.Distance(playerPosition, pending.Route.Waypoints[pending.StartIndex].Position);
+            pending.LastProgressAt = DateTime.UtcNow;
+            status = $"Exited the cave; preparing the outdoor path to {pending.Route.Name}...";
+            if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+            return true;
+        }
+
+        if (!pending.NavigationRequested)
+        {
+            var started = pending.CaveApproachStage == 0
+                ? adapter.TryNavigateTo(target, true, out var error)
+                : adapter.TryFollowPath(path.Reverse().Skip(1), true, out error);
+            if (!started)
+            {
+                BeginCaveExitIsleReturnFallback(pending, $"the guided cave exit could not start: {error}");
+                return true;
+            }
+            pending.NavigationRequested = true;
+            pending.NavigationWasThreeDimensional = true;
+            navigationRequestedAt = DateTime.UtcNow;
+        }
+
+        if (distance + 1.5f < pending.LastProgressDistance)
+        {
+            pending.LastProgressDistance = distance;
+            pending.LastProgressAt = DateTime.UtcNow;
+        }
+        else if (DateTime.UtcNow - pending.LastProgressAt > TimeSpan.FromSeconds(
+                     Math.Max(20, Math.Clamp(config.StuckTimeoutSeconds, 8, 60))))
+        {
+            BeginCaveExitIsleReturnFallback(pending, "the guided cave exit made no progress");
+            return true;
+        }
+
+        status = pending.CaveApproachStage == 0
+            ? $"Reaching the inner cave corridor before exiting for {pending.Route.Name}... ({distance:F0} yalms)"
+            : $"Following the guided flight out of the cave for {pending.Route.Name}... ({distance:F0} yalms)";
+        if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
+        if (DateTime.UtcNow - navigationRequestedAt >= TimeSpan.FromSeconds(2) && !adapter.IsNavigationBusy)
+            pending.NavigationRequested = false;
+        return true;
+    }
+
+    private void BeginCaveExitIsleReturnFallback(PendingRouteStart pending, string reason)
+    {
+        adapter.StopNavigation();
+        pending.NavigationRequested = false;
+        pending.CaveNavigationInitialized = false;
+        pending.UseIsleReturn = true;
+        pending.IsleReturnStartedAt = null;
+        pending.LastProgressAt = DateTime.UtcNow;
+        status = $"Could not leave the cave normally ({reason}); falling back to Isle Return.";
+        if (pending.Purpose == PendingRoutePurpose.Experimental) experimentalStatus = status;
     }
 
     private void StartPreparedRoute(PendingRouteStart pending)
@@ -1478,6 +1592,18 @@ public sealed partial class Plugin : IDalamudPlugin
 
     private static IReadOnlyList<Vector3> GetCaveApproach(RouteSnapshot route) =>
         IsLowerInitialCaveRoute(route) ? LowerCaveApproach : UpperCaveApproach;
+
+    private IReadOnlyList<Vector3> GetCaveExitApproach(Vector3 playerPosition)
+    {
+        var previousRoute = snapshot?.Routes
+            .FirstOrDefault(x => string.Equals(x.Name, lastFarmRoute, StringComparison.OrdinalIgnoreCase));
+        if (previousRoute != null && IsInitialCaveRoute(previousRoute)) return GetCaveApproach(previousRoute);
+
+        return Vector3.DistanceSquared(playerPosition, LowerCaveApproach[^1])
+               < Vector3.DistanceSquared(playerPosition, UpperCaveApproach[^1])
+            ? LowerCaveApproach
+            : UpperCaveApproach;
+    }
 
     private static bool IsInsideInitialCave(Vector3 position) =>
         position.X is >= 270f and <= 510f && position.Z <= -225f && position.Y <= 112f;
@@ -2578,8 +2704,10 @@ public sealed partial class Plugin : IDalamudPlugin
         public DateTime? IsleReturnStartedAt { get; set; }
         public bool ExitingCabin { get; set; }
         public bool CaveApproach { get; set; }
+        public bool CaveExit { get; set; }
         public int CaveApproachStage { get; set; }
         public bool CaveNavigationInitialized { get; set; }
+        public IReadOnlyList<Vector3>? CaveTransitionPath { get; set; }
     }
 
     private sealed record MountOption(uint Id, string Name);
