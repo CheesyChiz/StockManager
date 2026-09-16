@@ -43,6 +43,18 @@ Optional: [Lifestream](https://github.com/NightmareXIV/Lifestream) enables the *
 
 Test every imported route manually in Visland before enabling unattended switching.
 
+## CheesyChiz plugin catalog
+
+The repository URL below is a shared Dalamud catalog. Add it once to install either plugin:
+
+| Plugin | Purpose | Command |
+| --- | --- | --- |
+| **Stock Manager** | Island Sanctuary stock and route management | `/sm` |
+| [**Positional Cue**](https://github.com/CheesyChiz/PositionalCue) | Upcoming rear/flank HUD and gentle sound cues from Wrath Combo (test release) | `/pcue` |
+
+Each plugin keeps its own source repository and releases. Positional Cue requires
+Wrath Combo with positional IPC; it does not require Stock Manager, BossMod or Avarice.
+
 ## Installation
 
 1. Open `/xlsettings`.
@@ -50,7 +62,7 @@ Test every imported route manually in Visland before enabling unattended switchi
 3. Add the following URL under **Custom Plugin Repositories**:
 
    ```text
-   https://raw.githubusercontent.com/CheesyChiz/StockManager/main/repo.json
+   https://raw.githubusercontent.com/CheesyChiz/DalamudPlugins/main/repo.json
    ```
 
 4. Open `/xlplugins` and install **Stock Manager**.
