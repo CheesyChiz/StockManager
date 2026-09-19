@@ -19,8 +19,8 @@
     ],
     "IsHide": false,
     "IsTestingExclusive": false,
-    "DownloadLinkInstall": "https://github.com/CheesyChiz/StockManager/releases/download/v1.7.4/StockManager.zip",
-    "DownloadLinkUpdate": "https://github.com/CheesyChiz/StockManager/releases/download/v1.7.4/StockManager.zip",
+    "DownloadLinkInstall": "https://raw.githubusercontent.com/CheesyChiz/DalamudPlugins/main/packages/StockManager/1.7.4.0.zip",
+    "DownloadLinkUpdate": "https://raw.githubusercontent.com/CheesyChiz/DalamudPlugins/main/packages/StockManager/1.7.4.0.zip",
     "DownloadLinkTesting": null,
     "LastUpdate": 1785323283
   }
